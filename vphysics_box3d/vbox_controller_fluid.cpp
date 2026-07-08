@@ -103,9 +103,9 @@ namespace
 
 Box3DPhysicsFluidController::Box3DPhysicsFluidController(Box3DPhysicsObject* pFluidObject, const fluidparams_t* pParams)
     : m_pFluidObject(pFluidObject)
-    , m_Params(*pParams)
     , m_LocalPlane(PlaneToLocalSpace(pFluidObject, pParams->surfacePlane))
 {
+    V_memcpy(&m_Params, pParams, sizeof(m_Params));
     m_pFluidObject->BecomeTrigger();
 }
 

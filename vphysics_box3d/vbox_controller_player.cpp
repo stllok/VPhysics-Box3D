@@ -116,6 +116,7 @@ void Box3DPhysicsPlayerController::SetObjectInternal(Box3DPhysicsObject* pObject
         const b3BodyId oldId = m_pObject->GetBodyID();
         if (b3Body_IsValid(oldId))
             b3Body_SetAngularDamping(oldId, m_flSavedAngularDamping);
+        m_pObject->EnableDrag(m_bSavedDragEnabled);
         m_pObject->SetCallbackFlags(m_pObject->GetCallbackFlags() & ~CALLBACK_IS_PLAYER_CONTROLLER);
     }
 
@@ -129,6 +130,7 @@ void Box3DPhysicsPlayerController::SetObjectInternal(Box3DPhysicsObject* pObject
         // IVP replaces the controlled core's rot_speed_damp_factor with (100,100,100); heavy
         // angular damping is the box3d equivalent.
         // Which hull collides is the game's business (EnableCollisions via SetVCollisionState).
+        m_bSavedDragEnabled = m_pObject->IsDragEnabled();
         m_pObject->EnableDrag(false);
         m_flSavedAngularDamping = b3Body_GetAngularDamping(bodyId);
         b3Body_SetAngularDamping(bodyId, 100.0f);
@@ -151,10 +153,19 @@ void Box3DPhysicsPlayerController::ClearGround(Box3DPhysicsObject* pObject)
 void Box3DPhysicsPlayerController::Update(
     const Vector& position, const Vector& velocity, float secondsToArrival, bool onground, IPhysicsObject* ground)
 {
+    if (!position.IsValid() || !velocity.IsValid() || !IsFinite(secondsToArrival))
+        return;
+
     m_updatedSinceLast = true;
+    m_bGroundHint = onground;
+    Box3DPhysicsObject* pNewGround = static_cast<Box3DPhysicsObject*>(ground);
+    const bool bHasInputVelocity = velocity.LengthSqr() > 0.1f;
+    if (!bHasInputVelocity)
+        pNewGround = nullptr;
+    const bool bGroundChanged = m_pGround != pNewGround;
 
     // If the object hasn't moved, abort.
-    if ((velocity - m_currentSpeed).LengthSqr() < 1e-6f && (position - m_targetPosition).LengthSqr() < 1e-6f)
+    if (!bGroundChanged && (velocity - m_currentSpeed).LengthSqr() < 1e-6f && (position - m_targetPosition).LengthSqr() < 1e-6f)
         return;
 
     m_targetPosition = position;
@@ -169,14 +180,13 @@ void Box3DPhysicsPlayerController::Update(
     {
         // No input velocity, just go where physics takes you.
         m_enable = false;
-        ground = nullptr;
     }
     else
     {
         MaxSpeed(velocity);
     }
 
-    SetGround(static_cast<Box3DPhysicsObject*>(ground));
+    SetGround(pNewGround);
     if (m_pGround)
         m_pGround->WorldToLocal(&m_groundPosition, m_targetPosition);
 }
@@ -225,7 +235,7 @@ bool Box3DPhysicsPlayerController::IsInContact()
 
 void Box3DPhysicsPlayerController::MaxSpeed(const Vector& maxVelocity)
 {
-    if (!m_pObject)
+    if (!m_pObject || !maxVelocity.IsValid())
         return;
 
     Vector vCurrentVelocity;
@@ -256,7 +266,7 @@ int Box3DPhysicsPlayerController::GetShadowPosition(Vector* position, QAngle* an
 
 void Box3DPhysicsPlayerController::StepUp(float height)
 {
-    if (height == 0.0f || !m_pObject)
+    if (!IsFinite(height) || height == 0.0f || !m_pObject)
         return;
 
     Vector vPos;
@@ -268,6 +278,9 @@ void Box3DPhysicsPlayerController::StepUp(float height)
 
 void Box3DPhysicsPlayerController::Jump()
 {
+    m_bGroundHint = false;
+    if (m_pObject)
+        m_pObject->Wake();
 }
 
 void Box3DPhysicsPlayerController::GetShadowVelocity(Vector* velocity)
@@ -320,7 +333,9 @@ float Box3DPhysicsPlayerController::GetPushSpeedLimit()
 
 bool Box3DPhysicsPlayerController::WasFrozen()
 {
-    return false;
+    const bool bWasFrozen = m_bWasFrozen;
+    m_bWasFrozen = false;
+    return bWasFrozen;
 }
 
 int Box3DPhysicsPlayerController::TryTeleportObject()
@@ -341,6 +356,7 @@ int Box3DPhysicsPlayerController::TryTeleportObject()
     {
         m_pObject->SetPosition(m_targetPosition, qAngles, true);
     }
+    m_bWasFrozen = true;
     return 1;
 }
 
@@ -403,7 +419,7 @@ void Box3DPhysicsPlayerController::OnPreSimulate(float flDeltaTime)
     const float flMass = m_pObject->GetMass();
     const float flInvMass = flMass > 0.0f ? 1.0f / flMass : 0.0f;
     float flLimitVel = m_pushableSpeedLimit;
-    bool bGround = false;
+    bool bGround = m_bGroundHint;
     CNormalList normalList;
 
     b3ContactData contacts[32];

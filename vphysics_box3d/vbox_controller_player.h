@@ -57,6 +57,9 @@ private:
     float m_pushableMassLimit = VPHYSICS_MAX_MASS;
     float m_pushableSpeedLimit = 1e4f;
     float m_flSavedAngularDamping = 0.0f;
+    bool m_bSavedDragEnabled = false;
     bool m_enable = false;
     bool m_updatedSinceLast = false;
+    bool m_bGroundHint = false;
+    bool m_bWasFrozen = false;
 };

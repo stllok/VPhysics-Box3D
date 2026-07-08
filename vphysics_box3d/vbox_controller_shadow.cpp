@@ -31,6 +31,7 @@ Box3DPhysicsShadowController::Box3DPhysicsShadowController(
     uFlags &= ~CALLBACK_GLOBAL_FRICTION;
     uFlags &= ~CALLBACK_GLOBAL_COLLIDE_STATIC;
     m_pObject->SetCallbackFlags(uFlags);
+    m_savedDragEnabled = m_pObject->IsDragEnabled();
     m_pObject->EnableDrag(false);
 
     m_pObject->GetPosition(&m_targetPosition, &m_targetAngles);
@@ -44,7 +45,7 @@ Box3DPhysicsShadowController::~Box3DPhysicsShadowController()
     if (!bMarkedForDelete)
     {
         m_pObject->SetCallbackFlags(m_savedCallbackFlags);
-        m_pObject->EnableDrag(true);
+        m_pObject->EnableDrag(m_savedDragEnabled);
         UseShadowMaterial(false);
         m_pObject->EnableGravity(m_savedGravity);
 
@@ -55,6 +56,9 @@ Box3DPhysicsShadowController::~Box3DPhysicsShadowController()
 
 void Box3DPhysicsShadowController::Update(const Vector& position, const QAngle& angles, float timeOffset)
 {
+    if (!position.IsValid() || !angles.IsValid() || !IsFinite(timeOffset))
+        return;
+
     const Vector vecOldTarget = m_targetPosition;
     const QAngle angOldTarget = m_targetAngles;
 
@@ -72,6 +76,9 @@ void Box3DPhysicsShadowController::Update(const Vector& position, const QAngle& 
 
 void Box3DPhysicsShadowController::MaxSpeed(float maxSpeed, float maxAngularSpeed)
 {
+    if (!IsFinite(maxSpeed) || !IsFinite(maxAngularSpeed))
+        return;
+
     m_maxSpeed = maxSpeed;
     m_maxDampSpeed = maxSpeed;
     m_maxAngular = maxAngularSpeed;
@@ -80,7 +87,7 @@ void Box3DPhysicsShadowController::MaxSpeed(float maxSpeed, float maxAngularSpee
 
 void Box3DPhysicsShadowController::StepUp(float height)
 {
-    if (height == 0.0f)
+    if (!IsFinite(height) || height == 0.0f)
         return;
 
     Vector vecPos;
@@ -92,7 +99,8 @@ void Box3DPhysicsShadowController::StepUp(float height)
 
 void Box3DPhysicsShadowController::SetTeleportDistance(float teleportDistance)
 {
-    m_teleportDistance = teleportDistance;
+    if (IsFinite(teleportDistance))
+        m_teleportDistance = Max(teleportDistance, 0.0f);
 }
 
 bool Box3DPhysicsShadowController::AllowsTranslation()
@@ -167,13 +175,17 @@ void Box3DPhysicsShadowController::OnPreSimulate(float flDeltaTime)
     }
 
     // Velocity servo toward the target (blockable, physics-movable), same as IVP's shadow.
+    Vector currentPosition;
+    QAngle currentAngles;
+    m_pObject->GetPosition(&currentPosition, &currentAngles);
+
     hlshadowcontrol_params_t params = {};
-    params.targetPosition = m_targetPosition;
-    params.targetRotation = m_targetAngles;
-    params.maxSpeed = m_maxSpeed * MetresToInches;
-    params.maxAngular = m_maxAngular * RAD2DEG(1.0f);
-    params.maxDampSpeed = m_maxDampSpeed * MetresToInches;
-    params.maxDampAngular = m_maxDampAngular * RAD2DEG(1.0f);
+    params.targetPosition = m_allowTranslation ? m_targetPosition : currentPosition;
+    params.targetRotation = m_allowRotation ? m_targetAngles : currentAngles;
+    params.maxSpeed = m_allowTranslation ? m_maxSpeed * MetresToInches : 0.0f;
+    params.maxAngular = m_allowRotation ? m_maxAngular * RAD2DEG(1.0f) : 0.0f;
+    params.maxDampSpeed = m_allowTranslation ? m_maxDampSpeed * MetresToInches : 0.0f;
+    params.maxDampAngular = m_allowRotation ? m_maxDampAngular * RAD2DEG(1.0f) : 0.0f;
     params.dampFactor = 1.0f;
     params.teleportDistance = m_teleportDistance;
 

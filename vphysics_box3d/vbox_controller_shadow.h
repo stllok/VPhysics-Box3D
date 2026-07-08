@@ -48,6 +48,7 @@ private:
     float m_teleportDistance = 0.0f;
 
     bool m_savedGravity = true;
+    bool m_savedDragEnabled = false;
     int m_savedMaterialIndex = 0;
     unsigned short m_savedCallbackFlags = 0;
     bool m_allowTranslation = true;
