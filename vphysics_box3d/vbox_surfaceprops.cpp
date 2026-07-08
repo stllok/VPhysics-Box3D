@@ -186,6 +186,17 @@ UtlSymId_t Box3DPhysicsSurfaceProps::ResolveSurfaceIndex(int surfaceDataIndex) c
     return UtlSymId_t(surfaceDataIndex);
 }
 
+UtlSymId_t Box3DPhysicsSurfaceProps::ResolveWorldSurfaceIndex(int surfaceDataIndex) const
+{
+    if (IsReservedMaterialIndex(surfaceDataIndex))
+        surfaceDataIndex = GetReservedFallBack(surfaceDataIndex);
+
+    if (surfaceDataIndex >= 0 && surfaceDataIndex < m_WorldMaterialIndices.Count())
+        surfaceDataIndex = m_WorldMaterialIndices[surfaceDataIndex];
+
+    return ResolveSurfaceIndex(surfaceDataIndex);
+}
+
 int Box3DPhysicsSurfaceProps::GetSurfaceIndex(const char* pSurfacePropName) const
 {
     if (pSurfacePropName[0] == '$')
@@ -224,6 +235,17 @@ surfacedata_t* Box3DPhysicsSurfaceProps::GetSurfaceData(int surfaceDataIndex)
     return &prop.data;
 }
 
+int Box3DPhysicsSurfaceProps::GetWorldSurfaceIndex(int surfaceDataIndex) const
+{
+    return int(ResolveWorldSurfaceIndex(surfaceDataIndex));
+}
+
+surfacedata_t* Box3DPhysicsSurfaceProps::GetWorldSurfaceData(int surfaceDataIndex)
+{
+    Box3DSurfaceProp& prop = m_SurfaceProps[ResolveWorldSurfaceIndex(surfaceDataIndex)];
+    return &prop.data;
+}
+
 const char* Box3DPhysicsSurfaceProps::GetString(unsigned short stringTableIndex) const
 {
     return m_SoundStrings.String(stringTableIndex);
@@ -245,7 +267,13 @@ const char* Box3DPhysicsSurfaceProps::GetPropName(int surfaceDataIndex) const
 
 void Box3DPhysicsSurfaceProps::SetWorldMaterialIndexTable(int* pMapArray, int mapSize)
 {
-    Log_Stub(LOG_VBox3D);
+    m_WorldMaterialIndices.RemoveAll();
+    if (!pMapArray || mapSize <= 0)
+        return;
+
+    m_WorldMaterialIndices.SetCount(mapSize);
+    for (int i = 0; i < mapSize; i++)
+        m_WorldMaterialIndices[i] = pMapArray[i];
 }
 
 //-------------------------------------------------------------------------------------------------

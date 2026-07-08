@@ -67,6 +67,8 @@ public:
         return s_PhysicsSurfaceProps;
     }
 
+    int GetWorldSurfaceIndex(int surfaceDataIndex) const;
+    surfacedata_t* GetWorldSurfaceData(int surfaceDataIndex);
     unsigned short RegisterSound(const char* pName);
 
 private:
@@ -76,9 +78,11 @@ private:
     int GetReservedSurfaceIndex(const char* pSurfacePropName) const;
     int GetReservedFallBack(int nMaterialIndex) const;
     UtlSymId_t ResolveSurfaceIndex(int surfaceDataIndex) const;
+    UtlSymId_t ResolveWorldSurfaceIndex(int surfaceDataIndex) const;
 
     CUtlStringMap<Box3DSurfaceProp> m_SurfaceProps;
     CUtlSymbolTable m_SoundStrings;
+    CUtlVector<int> m_WorldMaterialIndices;
     int m_ShadowFallbackIdx = -1;
 
     static constexpr UtlSymId_t BaseMaterialIdx = UtlSymId_t(0);
