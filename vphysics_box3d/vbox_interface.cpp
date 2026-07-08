@@ -22,6 +22,13 @@ DEFINE_LOGGING_CHANNEL_NO_TAGS(LOG_VBox3D, "VBox3D", 0, LS_MESSAGE, Color(142, 2
 Box3DPhysicsInterface Box3DPhysicsInterface::s_PhysicsInterface;
 EXPOSE_SINGLE_INTERFACE_GLOBALVAR(
     Box3DPhysicsInterface, IPhysics, VPHYSICS_INTERFACE_VERSION, Box3DPhysicsInterface::GetInstance());
+#if GAME_GMOD
+static void* CreateBox3DPhysicsGModInterface()
+{
+    return static_cast<IPhysics*>(&Box3DPhysicsInterface::GetInstance());
+}
+static InterfaceReg s_Box3DPhysicsGModInterface(CreateBox3DPhysicsGModInterface, VPHYSICS_INTERFACE_VERSION_GMOD);
+#endif
 
 //-------------------------------------------------------------------------------------------------
 
@@ -114,13 +121,13 @@ void Box3DPhysicsInterface::DestroyObjectPairHash(IPhysicsObjectPairHash* pHash)
 
 IPhysicsCollisionSet* Box3DPhysicsInterface::FindOrCreateCollisionSet(unsigned int id, int maxElementCount)
 {
-    if (maxElementCount > 32)
+    if (maxElementCount < 0 || maxElementCount > 32)
         return nullptr;
 
     if (IPhysicsCollisionSet* pSet = FindCollisionSet(id))
         return pSet;
 
-    auto result = m_CollisionSets.emplace(id, Box3DPhysicsCollisionSet{});
+    auto result = m_CollisionSets.emplace(id, Box3DPhysicsCollisionSet(maxElementCount));
     return &result.first->second;
 }
 
@@ -137,3 +144,21 @@ void Box3DPhysicsInterface::DestroyAllCollisionSets()
 {
     m_CollisionSets.clear();
 }
+
+#if GAME_GMOD
+bool Box3DPhysicsInterface::IsValidPhysicsObject(IPhysicsObject* pObject)
+{
+    if (!pObject)
+        return false;
+
+    for (IPhysicsEnvironment* pEnvironment : m_Environments)
+    {
+        int nObjectCount = 0;
+        const IPhysicsObject** ppObjects = pEnvironment->GetObjectList(&nObjectCount);
+        for (int i = 0; i < nObjectCount; i++)
+            if (ppObjects[i] == pObject)
+                return true;
+    }
+    return false;
+}
+#endif

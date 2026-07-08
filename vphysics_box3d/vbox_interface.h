@@ -29,24 +29,47 @@ DECLARE_LOGGING_CHANNEL(LOG_VBox3D);
 class Box3DPhysicsCollisionSet final : public IPhysicsCollisionSet
 {
 public:
+    explicit Box3DPhysicsCollisionSet(int maxElementCount)
+        : m_nMaxElementCount(maxElementCount)
+    {
+        const uint32 nMask = maxElementCount >= 32 ? 0xFFFFFFFFu : ((1u << maxElementCount) - 1u);
+        for (int i = 0; i < m_nMaxElementCount; i++)
+            m_Bits[i] = nMask;
+    }
+
     void EnableCollisions(int index0, int index1) override
     {
+        if (!IsValidIndex(index0) || !IsValidIndex(index1))
+            return;
+
         m_Bits[index0] |= 1u << index1;
         m_Bits[index1] |= 1u << index0;
     }
 
     void DisableCollisions(int index0, int index1) override
     {
+        if (!IsValidIndex(index0) || !IsValidIndex(index1))
+            return;
+
         m_Bits[index0] &= ~(1u << index1);
         m_Bits[index1] &= ~(1u << index0);
     }
 
     bool ShouldCollide(int index0, int index1) override
     {
+        if (!IsValidIndex(index0) || !IsValidIndex(index1))
+            return true;
+
         return !!(m_Bits[index0] & (1u << index1));
     }
 
 private:
+    bool IsValidIndex(int index) const
+    {
+        return index >= 0 && index < m_nMaxElementCount;
+    }
+
+    int m_nMaxElementCount;
     std::array<uint32, 32> m_Bits = {};
 };
 
@@ -74,10 +97,7 @@ public:
     void DestroyAllCollisionSets() override;
 
 #if GAME_GMOD
-    bool IsValidPhysicsObject(IPhysicsObject* pObject) override
-    {
-        return pObject != nullptr;
-    }
+    bool IsValidPhysicsObject(IPhysicsObject* pObject) override;
 #endif
 
 public:
