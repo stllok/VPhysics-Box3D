@@ -100,11 +100,13 @@ void ParseBox3DKVSchema(
     KeyValues* pKV, const Box3DKVSchemaProp_t* pDescs, uint count, void* pObj, void* pUnknownKeyObj,
     IVPhysicsKeyHandler* pUnknownKeyHandler)
 {
-    bool bHandled = false;
+    if (!pKV || !pDescs || !pObj)
+        return;
 
     for (KeyValues* pProp = pKV->GetFirstSubKey(); pProp != nullptr; pProp = pProp->GetNextKey())
     {
         const char* pName = pProp->GetName();
+        bool bHandled = false;
 
         for (uint i = 0; i < count; i++)
         {
@@ -122,7 +124,14 @@ void ParseBox3DKVSchema(
 
                 char* pElement = reinterpret_cast<char*>(pObj) + desc.offset;
                 if (pArraySize)
+                {
+                    if (*pArraySize < 0 || static_cast<size_t>(*pArraySize) >= desc.arrayCount)
+                    {
+                        bHandled = true;
+                        continue;
+                    }
                     pElement += *pArraySize * desc.size;
+                }
 
                 desc.func.ReadFunc(pProp, reinterpret_cast<void*>(pElement), desc.size);
                 if (desc.fixupFunc)
@@ -140,6 +149,9 @@ void ParseBox3DKVSchema(
 
 void ParseBox3DKVCustom(KeyValues* pKV, void* pUnknownKeyObj, IVPhysicsKeyHandler* pUnknownKeyHandler)
 {
+    if (!pKV)
+        return;
+
     // Josh:
     // Parse out custom KV entries like "vehicle_sounds" etc
     // out recursively.
@@ -157,18 +169,22 @@ void ParseBox3DKVCustom(KeyValues* pKV, void* pUnknownKeyObj, IVPhysicsKeyHandle
 
 KeyValues* HeaderlessKVBufferToKeyValues(const char* pszBuffer, const char* pszSetName)
 {
+    const char* pszRootName = pszSetName ? pszSetName : "PhysProps";
+
     CUtlBuffer buffer;
     buffer.SetBufferType(true, true);
 
     buffer.SeekPut(CUtlBuffer::SEEK_HEAD, 0);
-    buffer.PutString("\"PhysProps\"\r\n{");
+    buffer.PutChar('"');
+    buffer.PutString(pszRootName);
+    buffer.PutString("\"\r\n{");
     buffer.PutString(pszBuffer);
     buffer.PutString("\r\n}");
     buffer.PutChar('\0');
 
-    KeyValues* pszKV = new KeyValues(pszSetName);
+    KeyValues* pszKV = new KeyValues(pszRootName);
 
-    if (!pszKV->LoadFromBuffer(pszSetName, buffer))
+    if (!pszKV->LoadFromBuffer(pszRootName, buffer))
     {
         pszKV->deleteThis();
         pszKV = nullptr;

@@ -292,12 +292,14 @@ static const Box3DKVSchemaProp_t kRagdollAnimatedFrictionDescs[] = {
 
 Box3DPhysicsParseKV::Box3DPhysicsParseKV(KeyValues* pKV)
     : m_pKV(pKV)
-    , m_pCurrentBlock(m_pKV->GetFirstSubKey())
+    , m_pCurrentBlock(m_pKV ? m_pKV->GetFirstSubKey() : nullptr)
 {
 }
 
 Box3DPhysicsParseKV::~Box3DPhysicsParseKV()
 {
+    if (m_pKV)
+        m_pKV->deleteThis();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -364,12 +366,15 @@ void Box3DPhysicsParseKV::ParseRagdollConstraint(
 
 void Box3DPhysicsParseKV::ParseSurfaceTable(int* table, IVPhysicsKeyHandler* unknownKeyHandler)
 {
+    if (!m_pCurrentBlock)
+        return;
+
     for (KeyValues* pProp = m_pCurrentBlock->GetFirstSubKey(); pProp != nullptr; pProp = pProp->GetNextKey())
     {
         int nPropIdx = Box3DPhysicsSurfaceProps::GetInstance().GetSurfaceIndex(pProp->GetName());
         int nTableIdx = pProp->GetInt();
 
-        if (nTableIdx < 128)
+        if (nTableIdx >= 0 && nTableIdx < 128)
             table[nTableIdx] = nPropIdx;
     }
 
