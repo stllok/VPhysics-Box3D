@@ -10,6 +10,8 @@
 #include "mathlib/polyhedron.h"
 #include "vbox_parse.h"
 
+#include <cstdint>
+
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
 
@@ -33,6 +35,99 @@ EXPOSE_SINGLE_INTERFACE_GLOBALVAR(
 // Box3D rejects a hull with >=255 half-edges (~6*verts-12), so a round prop's full-detail hull fails
 // to cook. Cap vertices so b3CreateHull simplifies below the limit (44 verts -> 252 half-edges).
 static constexpr int kMaxHullVertices = 44;
+
+static constexpr uint32 kVoxCollideMagic = MAKEID('V', 'O', 'X', 'C');
+static constexpr uint32 kVoxCollideVersion = 2;
+static constexpr int kVoxCollideMaxConvexes = 1024;
+static constexpr int kVoxCollideMaxMeshElements = 1 << 20;
+
+struct VoxCollideHeader
+{
+    uint32 magic;
+    uint32 version;
+    int32 convexCount;
+    int32 meshVertexCount;
+    int32 meshTriangleCount;
+    float massCenter[3];
+    float orthographicAreas[3];
+};
+
+struct VoxConvexHeader
+{
+    int32 vertexCount;
+    uint32 gameData;
+    int32 queryTriangleCount;
+};
+
+struct VoxWireVec3
+{
+    float x;
+    float y;
+    float z;
+};
+
+struct VoxWireTriangle
+{
+    int32 index1;
+    int32 index2;
+    int32 index3;
+};
+
+static_assert(sizeof(VoxCollideHeader) == sizeof(uint32) * 2 + sizeof(int32) * 3 + sizeof(float) * 6);
+static_assert(sizeof(VoxConvexHeader) == sizeof(int32) + sizeof(uint32) + sizeof(int32));
+static_assert(sizeof(VoxWireVec3) == sizeof(float) * 3);
+static_assert(sizeof(VoxWireTriangle) == sizeof(int32) * 3);
+
+static VoxWireVec3 ToVoxWireVec3(const b3Vec3& vec)
+{
+    return { vec.x, vec.y, vec.z };
+}
+
+static Vector FromVoxWireVector(const float (&vec)[3])
+{
+    return Vector(vec[0], vec[1], vec[2]);
+}
+
+static b3Vec3 FromVoxWireB3Vec3(const VoxWireVec3& vec)
+{
+    return { vec.x, vec.y, vec.z };
+}
+
+static bool IsValidVoxWireVec3(const VoxWireVec3& vec)
+{
+    return IsFinite(vec.x) && IsFinite(vec.y) && IsFinite(vec.z);
+}
+
+static VoxWireTriangle ToVoxWireTriangle(const b3MeshTriangle& tri)
+{
+    return { tri.index1, tri.index2, tri.index3 };
+}
+
+static int ConvexQueryTriangleCount(const CPhysConvex* pConvex)
+{
+    if (!pConvex)
+        return 0;
+    return Min(pConvex->m_QueryMaterials.Count(), pConvex->m_QueryVerts.Count() / 3);
+}
+
+static bool CheckedSerializedBytes(int count, size_t elemSize, size_t* pBytes)
+{
+    if (count < 0)
+        return false;
+    const size_t nCount = (size_t)count;
+    if (elemSize != 0 && nCount > (size_t)INT_MAX / elemSize)
+        return false;
+    *pBytes = nCount * elemSize;
+    return true;
+}
+
+static bool CheckedAddBytes(size_t& nBytes, size_t nAdd)
+{
+    if (nBytes > (size_t)INT_MAX - nAdd)
+        return false;
+    nBytes += nAdd;
+    return true;
+}
 
 namespace ivp_compat
 {
@@ -142,6 +237,168 @@ namespace ivp_compat
         COLLIDE_VIRTUAL = 3
     };
 
+    static uint16 SwapU16(uint16 value)
+    {
+        return (uint16)((value >> 8) | (value << 8));
+    }
+
+    static uint32 SwapU32(uint32 value)
+    {
+        return ((value & 0x000000FFu) << 24) | ((value & 0x0000FF00u) << 8) | ((value & 0x00FF0000u) >> 8)
+            | ((value & 0xFF000000u) >> 24);
+    }
+
+    static int ReadInt32(const void* p, bool bSwapped)
+    {
+        int value = 0;
+        V_memcpy(&value, p, sizeof(value));
+        if (!bSwapped)
+            return value;
+        uint32 swapped = SwapU32((uint32)value);
+        return (int)swapped;
+    }
+
+    static uint32 ReadUInt32(const void* p, bool bSwapped)
+    {
+        uint32 value = 0;
+        V_memcpy(&value, p, sizeof(value));
+        return bSwapped ? SwapU32(value) : value;
+    }
+
+    static uint16 ReadUInt16(const void* p, bool bSwapped)
+    {
+        uint16 value = 0;
+        V_memcpy(&value, p, sizeof(value));
+        return bSwapped ? SwapU16(value) : value;
+    }
+
+    static float ReadFloat32(const void* p, bool bSwapped)
+    {
+        uint32 bits = ReadUInt32(p, bSwapped);
+        float value = 0.0f;
+        V_memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    static const char* OffsetPtrChecked(const char* pBase, const char* pEnd, int offset, size_t nBytes)
+    {
+        if (!pBase || !pEnd || offset < 0 || pBase > pEnd)
+            return nullptr;
+        const size_t nOffset = (size_t)offset;
+        const size_t nRemaining = (size_t)(pEnd - pBase);
+        if (nOffset > nRemaining || nBytes > nRemaining - nOffset)
+            return nullptr;
+        return pBase + nOffset;
+    }
+
+    static bool CollectSwappedIVPLedges(
+        const char* pNode, const char* pEnd, CUtlVector<const char*>& vecOut, int nDepth = 0)
+    {
+        if (!pNode || nDepth > kVoxCollideMaxConvexes || pEnd - pNode < (ptrdiff_t)sizeof(compactledgenode_t))
+            return false;
+
+        const int nRightOffset = ReadInt32(pNode, true);
+        if (nRightOffset != 0)
+        {
+            const char* pRight = OffsetPtrChecked(pNode, pEnd, nRightOffset, sizeof(compactledgenode_t));
+            const char* pLeft = OffsetPtrChecked(pNode, pEnd, sizeof(compactledgenode_t), sizeof(compactledgenode_t));
+            return CollectSwappedIVPLedges(pRight, pEnd, vecOut, nDepth + 1)
+                && CollectSwappedIVPLedges(pLeft, pEnd, vecOut, nDepth + 1);
+        }
+
+        const int nLedgeOffset = ReadInt32(pNode + sizeof(int), true);
+        const char* pLedge = OffsetPtrChecked(pNode, pEnd, nLedgeOffset, sizeof(compactledge_t));
+        if (!pLedge)
+            return false;
+        vecOut.AddToTail(pLedge);
+        return true;
+    }
+
+    static CPhysConvex* IVPLedgeToConvexSwapped(const char* pLedge, const char* pEnd)
+    {
+        if (!pLedge || pEnd - pLedge < (ptrdiff_t)sizeof(compactledge_t))
+            return nullptr;
+
+        const int nPointOffset = ReadInt32(pLedge, true);
+        const int nClientData = ReadInt32(pLedge + sizeof(int), true);
+        const int nTriangles = (int)(int16)ReadUInt16(pLedge + 12, true);
+        if (nTriangles <= 0 || nTriangles > kVoxCollideMaxMeshElements / 3)
+            return nullptr;
+
+        size_t nTriangleBytes = 0;
+        if (!CheckedSerializedBytes(nTriangles, sizeof(compacttriangle_t), &nTriangleBytes))
+            return nullptr;
+        const char* pTriangles = OffsetPtrChecked(pLedge, pEnd, sizeof(compactledge_t), nTriangleBytes);
+        const char* pVertices = OffsetPtrChecked(pLedge, pEnd, nPointOffset, 0);
+        if (!pTriangles || !pVertices)
+            return nullptr;
+
+        const int nVertCount = nTriangles * 3;
+        CUtlVector<b3Vec3> verts;
+        verts.SetCount(nVertCount);
+        CUtlVector<uint8> materials;
+        materials.SetCount(nTriangles);
+
+        for (int i = 0; i < nTriangles; i++)
+        {
+            const char* pTriangle = pTriangles + i * sizeof(compacttriangle_t);
+            const uint32 nTriangleBits = ReadUInt32(pTriangle, true);
+            materials[i] = (uint8)((nTriangleBits >> 24) & 0x7Fu);
+            for (int j = 0; j < 3; j++)
+            {
+                const uint32 nEdgeBits = ReadUInt32(pTriangle + sizeof(uint32) * (j + 1), true);
+                const int nIndex = (int)(nEdgeBits & 0xFFFFu);
+                const char* pVertex = OffsetPtrChecked(pVertices, pEnd, nIndex * 16, sizeof(float) * 3);
+                if (!pVertex)
+                    return nullptr;
+
+                const float x = ReadFloat32(pVertex, true);
+                const float y = ReadFloat32(pVertex + sizeof(float), true);
+                const float z = ReadFloat32(pVertex + sizeof(float) * 2, true);
+                verts[(i * 3) + j] = b3Vec3{ x, z, -y };
+            }
+        }
+
+        b3HullData* pHull = b3CreateHull(verts.Base(), nVertCount, kMaxHullVertices);
+        if (!pHull)
+            return nullptr;
+
+        CPhysConvex* pConvex = new CPhysConvex;
+        pConvex->m_pHull = pHull;
+        pConvex->m_nGameData = nClientData;
+        pConvex->m_QueryVerts.CopyArray(verts.Base(), verts.Count());
+        pConvex->m_QueryMaterials.CopyArray(materials.Base(), materials.Count());
+        return pConvex;
+    }
+
+    static CPhysCollide* DeserializeIVP_PolySwapped(const compactsurface_t* pSurface, const char* pSurfaceEnd)
+    {
+        const char* pSurfaceBytes = reinterpret_cast<const char*>(pSurface);
+        const int nRootOffset = ReadInt32(pSurfaceBytes + 36, true);
+        const char* pFirstLedgeNode = OffsetPtrChecked(pSurfaceBytes, pSurfaceEnd, nRootOffset, sizeof(compactledgenode_t));
+        if (!pFirstLedgeNode)
+            return nullptr;
+
+        CUtlVector<const char*> ledges;
+        if (!CollectSwappedIVPLedges(pFirstLedgeNode, pSurfaceEnd, ledges))
+            return nullptr;
+
+        CPhysCollide* pCollide = new CPhysCollide;
+        for (int i = 0; i < ledges.Count(); i++)
+        {
+            CPhysConvex* pConvex = IVPLedgeToConvexSwapped(ledges[i], pSurfaceEnd);
+            if (pConvex)
+                pCollide->m_Convexes.AddToTail(pConvex);
+        }
+
+        if (pCollide->m_Convexes.Count() == 0)
+        {
+            delete pCollide;
+            return nullptr;
+        }
+        return pCollide;
+    }
+
     static CPhysConvex* IVPLedgeToConvex(const compactledge_t* pLedge)
     {
         if (!pLedge->n_triangles)
@@ -244,6 +501,165 @@ static CPhysConvex* HullToConvex(b3HullData* pHull)
     return pConvex;
 }
 
+static bool CheckedByteCount(int count, size_t elemSize, const char* pCursor, const char* pEnd, size_t* pBytes)
+{
+    if (count < 0)
+        return false;
+    const size_t nCount = (size_t)count;
+    if (elemSize != 0 && nCount > SIZE_MAX / elemSize)
+        return false;
+    const size_t nBytes = nCount * elemSize;
+    if ((size_t)(pEnd - pCursor) < nBytes)
+        return false;
+    *pBytes = nBytes;
+    return true;
+}
+
+static b3HullData* HullFromPlanes(const b3Plane* pPlanes, int planeCount, float insideEps, float dedupEps)
+{
+    if (!pPlanes || planeCount < 4)
+        return nullptr;
+
+    CUtlVector<b3Vec3> verts;
+    for (int i = 0; i < planeCount; i++)
+    {
+        const b3Vec3 ni = pPlanes[i].normal;
+        for (int j = i + 1; j < planeCount; j++)
+        {
+            const b3Vec3 nj = pPlanes[j].normal;
+            for (int k = j + 1; k < planeCount; k++)
+            {
+                const b3Vec3 nk = pPlanes[k].normal;
+                const b3Vec3 cjk = b3Cross(nj, nk);
+                const float det = b3Dot(ni, cjk);
+                if (fabsf(det) < 1e-6f)
+                    continue;
+
+                const b3Vec3 cki = b3Cross(nk, ni);
+                const b3Vec3 cij = b3Cross(ni, nj);
+                const b3Vec3 x = b3MulSV(1.0f / det,
+                    b3Add(b3Add(b3MulSV(pPlanes[i].offset, cjk), b3MulSV(pPlanes[j].offset, cki)),
+                        b3MulSV(pPlanes[k].offset, cij)));
+
+                bool bInside = true;
+                for (int m = 0; m < planeCount; m++)
+                {
+                    if (b3Dot(pPlanes[m].normal, x) - pPlanes[m].offset > insideEps)
+                    {
+                        bInside = false;
+                        break;
+                    }
+                }
+                if (!bInside)
+                    continue;
+
+                bool bDup = false;
+                for (int v = 0; v < verts.Count(); v++)
+                {
+                    if (b3Length(b3Sub(verts[v], x)) < dedupEps)
+                    {
+                        bDup = true;
+                        break;
+                    }
+                }
+                if (!bDup)
+                    verts.AddToTail(x);
+            }
+        }
+    }
+
+    if (verts.Count() < 4)
+        return nullptr;
+    return b3CreateHull(verts.Base(), verts.Count(), kMaxHullVertices);
+}
+
+static CPhysConvex* CloneScaledConvex(const CPhysConvex* pConvex, float flScale)
+{
+    if (!pConvex || !pConvex->m_pHull || !IsFinite(flScale) || fabsf(flScale) < FLT_EPSILON)
+        return nullptr;
+
+    const b3HullData* pHull = pConvex->m_pHull;
+    const b3Vec3* pPoints = b3GetHullPoints(pHull);
+    CUtlVector<b3Vec3> points;
+    points.SetCount(pHull->vertexCount);
+    for (int i = 0; i < pHull->vertexCount; i++)
+        points[i] = b3MulSV(flScale, pPoints[i]);
+
+    CPhysConvex* pOut = HullToConvex(b3CreateHull(points.Base(), points.Count(), kMaxHullVertices));
+    if (pOut)
+    {
+        pOut->m_nGameData = pConvex->m_nGameData;
+        pOut->m_QueryVerts.SetCount(pConvex->m_QueryVerts.Count());
+        for (int i = 0; i < pConvex->m_QueryVerts.Count(); i++)
+            pOut->m_QueryVerts[i] = b3MulSV(flScale, pConvex->m_QueryVerts[i]);
+        pOut->m_QueryMaterials.CopyArray(pConvex->m_QueryMaterials.Base(), pConvex->m_QueryMaterials.Count());
+    }
+    return pOut;
+}
+
+static CPhysCollide* CloneScaledCollide(const CPhysCollide* pCollide, float flScale)
+{
+    if (!pCollide || !IsFinite(flScale) || fabsf(flScale) < FLT_EPSILON)
+        return nullptr;
+
+    CPhysCollide* pOut = new CPhysCollide;
+    pOut->m_vecMassCenter = pCollide->m_vecMassCenter * flScale;
+    pOut->m_vecOrthographicAreas = pCollide->m_vecOrthographicAreas * (flScale * flScale);
+
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+    {
+        CPhysConvex* pConvex = CloneScaledConvex(pCollide->m_Convexes[i], flScale);
+        if (pConvex)
+            pOut->m_Convexes.AddToTail(pConvex);
+    }
+
+    if (pCollide->m_pMesh)
+    {
+        const b3MeshData* pMesh = pCollide->m_pMesh;
+        const b3Vec3* pVerts = b3GetMeshVertices(pMesh);
+        const b3MeshTriangle* pTris = b3GetMeshTriangles(pMesh);
+        const uint8_t* pMats = b3GetMeshMaterialIndices(pMesh);
+
+        CUtlVector<b3Vec3> verts;
+        verts.SetCount(pMesh->vertexCount);
+        for (int i = 0; i < pMesh->vertexCount; i++)
+            verts[i] = b3MulSV(flScale, pVerts[i]);
+
+        CUtlVector<int32> indices;
+        indices.SetCount(pMesh->triangleCount * 3);
+        for (int i = 0; i < pMesh->triangleCount; i++)
+        {
+            indices[i * 3 + 0] = pTris[i].index1;
+            indices[i * 3 + 1] = pTris[i].index2;
+            indices[i * 3 + 2] = pTris[i].index3;
+        }
+
+        CUtlVector<uint8> materials;
+        materials.SetCount(pMesh->triangleCount);
+        for (int i = 0; i < pMesh->triangleCount; i++)
+            materials[i] = pMats ? pMats[i] : 0;
+
+        b3MeshDef def = {};
+        def.vertices = verts.Base();
+        def.vertexCount = verts.Count();
+        def.indices = indices.Base();
+        def.triangleCount = pMesh->triangleCount;
+        def.materialIndices = materials.Base();
+        def.weldVertices = true;
+        def.weldTolerance = SourceToBox::Distance(0.1f);
+        def.identifyEdges = true;
+        pOut->m_pMesh = b3CreateMesh(&def, nullptr, 0);
+    }
+
+    if (pOut->m_Convexes.Count() == 0 && !pOut->m_pMesh)
+    {
+        delete pOut;
+        return nullptr;
+    }
+
+    return pOut;
+}
+
 const b3HullData* CPhysConvex::GetSimHull()
 {
     if (m_pSimHull)
@@ -325,18 +741,42 @@ const b3HullData* CPhysConvex::GetSimHull()
 
 CPhysConvex* Box3DPhysicsCollision::ConvexFromVerts(Vector** pVerts, int vertCount)
 {
+    if (!pVerts || vertCount < 4)
+        return nullptr;
+
     CUtlVector<b3Vec3> points;
     points.SetCount(vertCount);
     for (int i = 0; i < vertCount; i++)
+    {
+        if (!pVerts[i] || !pVerts[i]->IsValid())
+            return nullptr;
         points[i] = SourceToBox::Distance(*pVerts[i]);
+    }
 
     return HullToConvex(b3CreateHull(points.Base(), vertCount, kMaxHullVertices));
 }
 
 CPhysConvex* Box3DPhysicsCollision::ConvexFromPlanes(float* pPlanes, int planeCount, float mergeDistance)
 {
-    Log_Stub(LOG_VBox3D);
-    return nullptr;
+    if (!pPlanes || planeCount < 4 || !IsFinite(mergeDistance))
+        return nullptr;
+
+    CUtlVector<b3Plane> planes;
+    planes.SetCount(planeCount);
+    for (int i = 0; i < planeCount; i++)
+    {
+        Vector normal(pPlanes[i * 4 + 0], pPlanes[i * 4 + 1], pPlanes[i * 4 + 2]);
+        if (!normal.IsValid() || normal.LengthSqr() <= FLT_EPSILON || !IsFinite(pPlanes[i * 4 + 3]))
+            return nullptr;
+        VectorNormalize(normal);
+        planes[i].normal = SourceToBox::Unitless(normal);
+        planes[i].offset = SourceToBox::Distance(pPlanes[i * 4 + 3]);
+    }
+
+    const float flMergeDistance = Max(mergeDistance, 0.01f);
+    const float flInsideEps = SourceToBox::Distance(flMergeDistance);
+    const float flDedupEps = SourceToBox::Distance(flMergeDistance);
+    return HullToConvex(HullFromPlanes(planes.Base(), planes.Count(), flInsideEps, flDedupEps));
 }
 
 float Box3DPhysicsCollision::ConvexVolume(CPhysConvex* pConvex)
@@ -351,8 +791,9 @@ float Box3DPhysicsCollision::ConvexVolume(CPhysConvex* pConvex)
 
 float Box3DPhysicsCollision::ConvexSurfaceArea(CPhysConvex* pConvex)
 {
-    Log_Stub(LOG_VBox3D);
-    return 0.0f;
+    if (!pConvex || !pConvex->m_pHull)
+        return 0.0f;
+    return BoxToSource::Area(pConvex->m_pHull->surfaceArea);
 }
 
 void Box3DPhysicsCollision::SetConvexGameData(CPhysConvex* pConvex, unsigned int gameData)
@@ -422,7 +863,7 @@ void Box3DPhysicsCollision::PolysoupAddTriangle(
     pSoup->m_Vertices.AddToTail(SourceToBox::Distance(a));
     pSoup->m_Vertices.AddToTail(SourceToBox::Distance(b));
     pSoup->m_Vertices.AddToTail(SourceToBox::Distance(c));
-    pSoup->m_MaterialIndices.AddToTail((uint8)materialIndex7bits);
+    pSoup->m_MaterialIndices.AddToTail((uint8)clamp(materialIndex7bits, 0, 0x7f));
 }
 
 CPhysCollide* Box3DPhysicsCollision::ConvertPolysoupToCollide(CPhysPolysoup* pSoup, bool useMOPP)
@@ -521,20 +962,306 @@ void Box3DPhysicsCollision::DestroyCollide(CPhysCollide* pCollide)
 
 int Box3DPhysicsCollision::CollideSize(CPhysCollide* pCollide)
 {
-    Log_Stub(LOG_VBox3D);
-    return 0;
+    if (!pCollide)
+        return 0;
+
+    size_t nBytes = 0;
+    if (!CheckedAddBytes(nBytes, sizeof(VoxCollideHeader)))
+        return 0;
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+    {
+        const CPhysConvex* pConvex = pCollide->m_Convexes[i];
+        if (!pConvex || !pConvex->m_pHull)
+            continue;
+        size_t nHullBytes = 0;
+        if (!CheckedAddBytes(nBytes, sizeof(VoxConvexHeader))
+            || !CheckedSerializedBytes(pConvex->m_pHull->vertexCount, sizeof(VoxWireVec3), &nHullBytes)
+            || !CheckedAddBytes(nBytes, nHullBytes))
+            return 0;
+
+        const int nQueryTriangles = ConvexQueryTriangleCount(pConvex);
+        if (nQueryTriangles > 0)
+        {
+            size_t nQueryVertBytes = 0;
+            size_t nQueryMatBytes = 0;
+            if (nQueryTriangles > INT_MAX / 3 || !CheckedSerializedBytes(nQueryTriangles * 3, sizeof(VoxWireVec3), &nQueryVertBytes)
+                || !CheckedSerializedBytes(nQueryTriangles, sizeof(uint8), &nQueryMatBytes)
+                || !CheckedAddBytes(nBytes, nQueryVertBytes) || !CheckedAddBytes(nBytes, nQueryMatBytes))
+                return 0;
+        }
+    }
+
+    if (pCollide->m_pMesh)
+    {
+        size_t nVertBytes = 0;
+        size_t nTriBytes = 0;
+        size_t nMatBytes = 0;
+        if (!CheckedSerializedBytes(pCollide->m_pMesh->vertexCount, sizeof(VoxWireVec3), &nVertBytes)
+            || !CheckedSerializedBytes(pCollide->m_pMesh->triangleCount, sizeof(VoxWireTriangle), &nTriBytes)
+            || !CheckedSerializedBytes(pCollide->m_pMesh->triangleCount, sizeof(uint8), &nMatBytes)
+            || !CheckedAddBytes(nBytes, nVertBytes) || !CheckedAddBytes(nBytes, nTriBytes) || !CheckedAddBytes(nBytes, nMatBytes))
+            return 0;
+    }
+
+    return (int)nBytes;
 }
 
 int Box3DPhysicsCollision::CollideWrite(char* pDest, CPhysCollide* pCollide, bool bSwap)
 {
-    Log_Stub(LOG_VBox3D);
-    return 0;
+    const int nSize = CollideSize(pCollide);
+    if (!pDest || !pCollide || nSize <= 0 || bSwap)
+        return 0;
+
+    VoxCollideHeader header = {};
+    header.magic = kVoxCollideMagic;
+    header.version = kVoxCollideVersion;
+    header.massCenter[0] = pCollide->m_vecMassCenter.x;
+    header.massCenter[1] = pCollide->m_vecMassCenter.y;
+    header.massCenter[2] = pCollide->m_vecMassCenter.z;
+    header.orthographicAreas[0] = pCollide->m_vecOrthographicAreas.x;
+    header.orthographicAreas[1] = pCollide->m_vecOrthographicAreas.y;
+    header.orthographicAreas[2] = pCollide->m_vecOrthographicAreas.z;
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+    {
+        if (pCollide->m_Convexes[i] && pCollide->m_Convexes[i]->m_pHull)
+            header.convexCount++;
+    }
+    if (pCollide->m_pMesh)
+    {
+        header.meshVertexCount = pCollide->m_pMesh->vertexCount;
+        header.meshTriangleCount = pCollide->m_pMesh->triangleCount;
+    }
+
+    char* pOut = pDest;
+    V_memcpy(pOut, &header, sizeof(header));
+    pOut += sizeof(header);
+
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+    {
+        const CPhysConvex* pConvex = pCollide->m_Convexes[i];
+        if (!pConvex || !pConvex->m_pHull)
+            continue;
+
+        const int nQueryTriangles = ConvexQueryTriangleCount(pConvex);
+        VoxConvexHeader convexHeader = { pConvex->m_pHull->vertexCount, pConvex->m_nGameData, nQueryTriangles };
+        V_memcpy(pOut, &convexHeader, sizeof(convexHeader));
+        pOut += sizeof(convexHeader);
+        const b3Vec3* pPoints = b3GetHullPoints(pConvex->m_pHull);
+        for (int j = 0; j < pConvex->m_pHull->vertexCount; j++)
+        {
+            const VoxWireVec3 point = ToVoxWireVec3(pPoints[j]);
+            V_memcpy(pOut, &point, sizeof(point));
+            pOut += sizeof(point);
+        }
+        for (int t = 0; t < nQueryTriangles; t++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                const VoxWireVec3 point = ToVoxWireVec3(pConvex->m_QueryVerts[t * 3 + j]);
+                V_memcpy(pOut, &point, sizeof(point));
+                pOut += sizeof(point);
+            }
+        }
+        if (nQueryTriangles > 0)
+        {
+            V_memcpy(pOut, pConvex->m_QueryMaterials.Base(), sizeof(uint8) * nQueryTriangles);
+            pOut += sizeof(uint8) * nQueryTriangles;
+        }
+    }
+
+    if (pCollide->m_pMesh)
+    {
+        const b3MeshData* pMesh = pCollide->m_pMesh;
+        const size_t nMatBytes = sizeof(uint8) * pMesh->triangleCount;
+        const b3Vec3* pVerts = b3GetMeshVertices(pMesh);
+        for (int i = 0; i < pMesh->vertexCount; i++)
+        {
+            const VoxWireVec3 vertex = ToVoxWireVec3(pVerts[i]);
+            V_memcpy(pOut, &vertex, sizeof(vertex));
+            pOut += sizeof(vertex);
+        }
+        const b3MeshTriangle* pTris = b3GetMeshTriangles(pMesh);
+        for (int i = 0; i < pMesh->triangleCount; i++)
+        {
+            const VoxWireTriangle tri = ToVoxWireTriangle(pTris[i]);
+            V_memcpy(pOut, &tri, sizeof(tri));
+            pOut += sizeof(tri);
+        }
+        const uint8_t* pMats = b3GetMeshMaterialIndices(pMesh);
+        if (pMats)
+            V_memcpy(pOut, pMats, nMatBytes);
+        else
+            V_memset(pOut, 0, nMatBytes);
+        pOut += nMatBytes;
+    }
+
+    return (int)(pOut - pDest);
 }
 
 CPhysCollide* Box3DPhysicsCollision::UnserializeCollide(char* pBuffer, int size, int index)
 {
-    Log_Stub(LOG_VBox3D);
-    return nullptr;
+    if (!pBuffer || size < (int)sizeof(VoxCollideHeader) || index != 0)
+        return nullptr;
+
+    const char* pCursor = pBuffer;
+    const char* pEnd = pBuffer + size;
+    VoxCollideHeader header = {};
+    V_memcpy(&header, pCursor, sizeof(header));
+    pCursor += sizeof(header);
+    if (header.magic != kVoxCollideMagic || header.version != kVoxCollideVersion || header.convexCount < 0
+        || header.convexCount > kVoxCollideMaxConvexes || header.meshVertexCount < 0
+        || header.meshVertexCount > kVoxCollideMaxMeshElements || header.meshTriangleCount < 0
+        || header.meshTriangleCount > kVoxCollideMaxMeshElements)
+        return nullptr;
+
+    if (!FromVoxWireVector(header.massCenter).IsValid() || !FromVoxWireVector(header.orthographicAreas).IsValid())
+        return nullptr;
+
+    CPhysCollide* pCollide = new CPhysCollide;
+    pCollide->m_vecMassCenter = FromVoxWireVector(header.massCenter);
+    pCollide->m_vecOrthographicAreas = FromVoxWireVector(header.orthographicAreas);
+
+    for (int i = 0; i < header.convexCount; i++)
+    {
+        if (pEnd - pCursor < (int)sizeof(VoxConvexHeader))
+        {
+            DestroyCollide(pCollide);
+            return nullptr;
+        }
+        VoxConvexHeader convexHeader = {};
+        V_memcpy(&convexHeader, pCursor, sizeof(convexHeader));
+        pCursor += sizeof(convexHeader);
+        size_t nPointBytes = 0;
+        size_t nQueryVertBytes = 0;
+        size_t nQueryMatBytes = 0;
+        if (convexHeader.vertexCount < 4 || convexHeader.vertexCount > kMaxHullVertices
+            || convexHeader.queryTriangleCount < 0 || convexHeader.queryTriangleCount > kVoxCollideMaxMeshElements
+            || convexHeader.queryTriangleCount > INT_MAX / 3
+            || !CheckedByteCount(convexHeader.vertexCount, sizeof(VoxWireVec3), pCursor, pEnd, &nPointBytes)
+            || !CheckedByteCount(convexHeader.queryTriangleCount * 3, sizeof(VoxWireVec3), pCursor + nPointBytes, pEnd, &nQueryVertBytes)
+            || !CheckedByteCount(
+                convexHeader.queryTriangleCount, sizeof(uint8), pCursor + nPointBytes + nQueryVertBytes, pEnd, &nQueryMatBytes))
+        {
+            DestroyCollide(pCollide);
+            return nullptr;
+        }
+
+        CUtlVector<b3Vec3> points;
+        points.SetCount(convexHeader.vertexCount);
+        for (int j = 0; j < convexHeader.vertexCount; j++)
+        {
+            VoxWireVec3 point = {};
+            V_memcpy(&point, pCursor + sizeof(point) * j, sizeof(point));
+            if (!IsValidVoxWireVec3(point))
+            {
+                DestroyCollide(pCollide);
+                return nullptr;
+            }
+            points[j] = FromVoxWireB3Vec3(point);
+        }
+
+        CPhysConvex* pConvex = HullToConvex(b3CreateHull(points.Base(), convexHeader.vertexCount, kMaxHullVertices));
+        pCursor += nPointBytes;
+        if (pConvex)
+        {
+            pConvex->m_nGameData = convexHeader.gameData;
+            if (convexHeader.queryTriangleCount > 0)
+            {
+                const char* pQueryCursor = pCursor;
+                const int nQueryVerts = convexHeader.queryTriangleCount * 3;
+                pConvex->m_QueryVerts.SetCount(nQueryVerts);
+                for (int q = 0; q < nQueryVerts; q++)
+                {
+                    VoxWireVec3 point = {};
+                    V_memcpy(&point, pQueryCursor + sizeof(point) * q, sizeof(point));
+                    if (!IsValidVoxWireVec3(point))
+                    {
+                        DestroyCollide(pCollide);
+                        return nullptr;
+                    }
+                    pConvex->m_QueryVerts[q] = FromVoxWireB3Vec3(point);
+                }
+                pQueryCursor += nQueryVertBytes;
+                pConvex->m_QueryMaterials.SetCount(convexHeader.queryTriangleCount);
+                V_memcpy(pConvex->m_QueryMaterials.Base(), pQueryCursor, nQueryMatBytes);
+            }
+            pCollide->m_Convexes.AddToTail(pConvex);
+        }
+        pCursor += nQueryVertBytes + nQueryMatBytes;
+    }
+
+    if (header.meshVertexCount > 0 || header.meshTriangleCount > 0)
+    {
+        size_t nVertBytes = 0;
+        size_t nTriBytes = 0;
+        size_t nMatBytes = 0;
+        if (header.meshVertexCount < 3 || header.meshTriangleCount < 1
+            || !CheckedByteCount(header.meshVertexCount, sizeof(VoxWireVec3), pCursor, pEnd, &nVertBytes)
+            || !CheckedByteCount(header.meshTriangleCount, sizeof(VoxWireTriangle), pCursor + nVertBytes, pEnd, &nTriBytes)
+            || !CheckedByteCount(header.meshTriangleCount, sizeof(uint8), pCursor + nVertBytes + nTriBytes, pEnd, &nMatBytes))
+        {
+            DestroyCollide(pCollide);
+            return nullptr;
+        }
+
+        CUtlVector<b3Vec3> verts;
+        verts.SetCount(header.meshVertexCount);
+        for (int i = 0; i < header.meshVertexCount; i++)
+        {
+            VoxWireVec3 vertex = {};
+            V_memcpy(&vertex, pCursor + sizeof(vertex) * i, sizeof(vertex));
+            if (!IsValidVoxWireVec3(vertex))
+            {
+                DestroyCollide(pCollide);
+                return nullptr;
+            }
+            verts[i] = FromVoxWireB3Vec3(vertex);
+        }
+        pCursor += nVertBytes;
+
+        CUtlVector<int32> indices;
+        indices.SetCount(header.meshTriangleCount * 3);
+        for (int i = 0; i < header.meshTriangleCount; i++)
+        {
+            VoxWireTriangle tri = {};
+            V_memcpy(&tri, pCursor + sizeof(tri) * i, sizeof(tri));
+            if (tri.index1 < 0 || tri.index1 >= header.meshVertexCount || tri.index2 < 0 || tri.index2 >= header.meshVertexCount
+                || tri.index3 < 0 || tri.index3 >= header.meshVertexCount)
+            {
+                DestroyCollide(pCollide);
+                return nullptr;
+            }
+            indices[i * 3 + 0] = tri.index1;
+            indices[i * 3 + 1] = tri.index2;
+            indices[i * 3 + 2] = tri.index3;
+        }
+        pCursor += nTriBytes;
+        const uint8* pMats = reinterpret_cast<const uint8*>(pCursor);
+        pCursor += nMatBytes;
+
+        b3MeshDef def = {};
+        def.vertices = verts.Base();
+        def.vertexCount = header.meshVertexCount;
+        def.indices = indices.Base();
+        def.triangleCount = header.meshTriangleCount;
+        def.materialIndices = const_cast<uint8*>(pMats);
+        def.weldVertices = true;
+        def.weldTolerance = SourceToBox::Distance(0.1f);
+        def.identifyEdges = true;
+        pCollide->m_pMesh = b3CreateMesh(&def, nullptr, 0);
+    }
+
+    if (pCollide->m_Convexes.Count() == 0 && !pCollide->m_pMesh)
+    {
+        DestroyCollide(pCollide);
+        return nullptr;
+    }
+    if (pCursor != pEnd)
+    {
+        DestroyCollide(pCollide);
+        return nullptr;
+    }
+    return pCollide;
 }
 
 float Box3DPhysicsCollision::CollideVolume(CPhysCollide* pCollide)
@@ -551,8 +1278,15 @@ float Box3DPhysicsCollision::CollideVolume(CPhysCollide* pCollide)
 
 float Box3DPhysicsCollision::CollideSurfaceArea(CPhysCollide* pCollide)
 {
-    Log_Stub(LOG_VBox3D);
-    return 0.0f;
+    if (!pCollide)
+        return 0.0f;
+
+    float area = 0.0f;
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+        area += ConvexSurfaceArea(pCollide->m_Convexes[i]);
+    if (pCollide->m_pMesh)
+        area += BoxToSource::Area(pCollide->m_pMesh->surfaceArea);
+    return area;
 }
 
 // The support point: the collide's farthest vertex along the direction, in world space.
@@ -1069,54 +1803,112 @@ void Box3DPhysicsCollision::TraceCollide(
 bool Box3DPhysicsCollision::IsBoxIntersectingCone(
     const Vector& boxAbsMins, const Vector& boxAbsMaxs, const truncatedcone_t& cone)
 {
-    Log_Stub(LOG_VBox3D);
-    return false;
+    if (!boxAbsMins.IsValid() || !boxAbsMaxs.IsValid() || !cone.origin.IsValid() || !cone.normal.IsValid()
+        || !IsFinite(cone.h) || !IsFinite(cone.theta) || cone.h <= 0.0f || cone.theta <= 0.0f)
+        return false;
+
+    Vector axis = cone.normal;
+    if (VectorNormalize(axis) <= FLT_EPSILON)
+        return false;
+
+    const Vector center = (boxAbsMins + boxAbsMaxs) * 0.5f;
+    const Vector extents = (boxAbsMaxs - boxAbsMins) * 0.5f;
+    const float flRadius = extents.Length();
+    const float flTan = tanf(DEG2RAD(cone.theta));
+
+    const Vector toCenter = center - cone.origin;
+    const float flAxisDist = DotProduct(toCenter, axis);
+    if (flAxisDist < -flRadius || flAxisDist > cone.h + flRadius)
+        return false;
+
+    const Vector closestAxisPoint = cone.origin + axis * clamp(flAxisDist, 0.0f, cone.h);
+    const float flConeRadius = clamp(flAxisDist, 0.0f, cone.h) * flTan;
+    return (center - closestAxisPoint).LengthSqr() <= Square(flConeRadius + flRadius);
 }
 
 void Box3DPhysicsCollision::VCollideLoad(vcollide_t* pOutput, int solidCount, const char* pBuffer, int size, bool swap)
 {
-    if (swap)
+    if (!pOutput)
+        return;
+
+    V_memset(pOutput, 0, sizeof(*pOutput));
+    if (!pBuffer || solidCount <= 0 || size <= 0 || solidCount > size / (int)sizeof(int))
         return;
 
     pOutput->solidCount = solidCount;
     pOutput->solids = new CPhysCollide*[solidCount];
+    V_memset(pOutput->solids, 0, sizeof(CPhysCollide*) * solidCount);
 
     const char* pCursor = pBuffer;
+    const char* pEnd = pBuffer + size;
     for (int i = 0; i < solidCount; i++)
     {
         pOutput->solids[i] = nullptr;
 
-        const int solidSize = *reinterpret_cast<const int*>(pCursor);
-        pCursor += sizeof(int);
-
-        const ivp_compat::collideheader_t* pCollideHeader = reinterpret_cast<const ivp_compat::collideheader_t*>(pCursor);
-
-        if (pCollideHeader->vphysicsID == ivp_compat::VPHYSICS_COLLISION_ID)
+        if (pEnd - pCursor < (ptrdiff_t)sizeof(int))
         {
-            if (pCollideHeader->version != ivp_compat::VPHYSICS_COLLISION_VERSION)
-                Log_Warning(LOG_VBox3D, "Solid with unknown version: 0x%x, may crash!\n", pCollideHeader->version);
-
-            if (pCollideHeader->modelType == ivp_compat::COLLIDE_POLY)
-                pOutput->solids[i] = ivp_compat::DeserializeIVP_Poly(pCollideHeader);
-            else
-                Log_Warning(
-                    LOG_VBox3D, "Unsupported solid type 0x%x on solid %d. Skipping...\n", (int)pCollideHeader->modelType, i);
+            pCursor = pEnd;
+            break;
         }
-        else
+
+        int solidSize = 0;
+        V_memcpy(&solidSize, pCursor, sizeof(solidSize));
+        solidSize = ivp_compat::ReadInt32(&solidSize, swap);
+        pCursor += sizeof(int);
+        if (solidSize < 0 || pEnd - pCursor < solidSize)
         {
-            // Legacy .phy: just a dumped compact surface.
+            pCursor = pEnd;
+            break;
+        }
+
+        const char* pSolidEnd = pCursor + solidSize;
+
+        if (solidSize >= (int)sizeof(ivp_compat::collideheader_t))
+        {
+            const ivp_compat::collideheader_t* pCollideHeader = reinterpret_cast<const ivp_compat::collideheader_t*>(pCursor);
+            const int nVPhysicsId = ivp_compat::ReadInt32(&pCollideHeader->vphysicsID, swap);
+            const short nVersion = (short)ivp_compat::ReadUInt16(&pCollideHeader->version, swap);
+            const short nModelType = (short)ivp_compat::ReadUInt16(&pCollideHeader->modelType, swap);
+
+            if (nVPhysicsId == ivp_compat::VPHYSICS_COLLISION_ID)
+            {
+                if (nVersion != ivp_compat::VPHYSICS_COLLISION_VERSION)
+                    Log_Warning(LOG_VBox3D, "Solid with unknown version: 0x%x, may crash!\n", nVersion);
+
+                if (nModelType == ivp_compat::COLLIDE_POLY)
+                {
+                    const char* pSurface = pCursor + sizeof(ivp_compat::collideheader_t) + sizeof(ivp_compat::compactsurfaceheader_t);
+                    if (pSurface <= pSolidEnd && pSolidEnd - pSurface >= (ptrdiff_t)sizeof(ivp_compat::compactsurface_t))
+                    {
+                        pOutput->solids[i] = swap
+                            ? ivp_compat::DeserializeIVP_PolySwapped(
+                                reinterpret_cast<const ivp_compat::compactsurface_t*>(pSurface), pSolidEnd)
+                            : ivp_compat::DeserializeIVP_Poly(pCollideHeader);
+                    }
+                }
+                else
+                    Log_Warning(
+                        LOG_VBox3D, "Unsupported solid type 0x%x on solid %d. Skipping...\n", (int)nModelType, i);
+            }
+        }
+        if (!pOutput->solids[i] && solidSize >= (int)sizeof(ivp_compat::compactsurface_t))
+        {
             const ivp_compat::compactsurface_t* pCompactSurface = reinterpret_cast<const ivp_compat::compactsurface_t*>(
                 pCursor);
             const int legacyModelType = pCompactSurface->dummy[2];
-            if (legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_SUPER_LEGACY
-                || legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_ID
-                || legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_ID_SWAPPED)
+            const int swappedLegacyModelType = ivp_compat::ReadInt32(&pCompactSurface->dummy[2], true);
+            if (!swap && (legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_SUPER_LEGACY
+                || legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_ID))
                 pOutput->solids[i] = ivp_compat::DeserializeIVP_Poly(pCompactSurface);
+            else if (swap || legacyModelType == ivp_compat::IVP_COMPACT_SURFACE_ID_SWAPPED
+                || swappedLegacyModelType == ivp_compat::IVP_COMPACT_SURFACE_SUPER_LEGACY
+                || swappedLegacyModelType == ivp_compat::IVP_COMPACT_SURFACE_ID)
+                pOutput->solids[i] = ivp_compat::DeserializeIVP_PolySwapped(pCompactSurface, pSolidEnd);
             else
                 Log_Warning(LOG_VBox3D, "Unsupported legacy solid type 0x%x on solid %d. Skipping...\n", legacyModelType, i);
         }
 
-        pCursor += solidSize;
+        pCursor = pSolidEnd;
     }
 
     // The rest of the buffer is the KeyValues text.
@@ -1133,6 +1925,9 @@ void Box3DPhysicsCollision::VCollideLoad(vcollide_t* pOutput, int solidCount, co
 
 void Box3DPhysicsCollision::VCollideUnload(vcollide_t* pVCollide)
 {
+    if (!pVCollide)
+        return;
+
     for (int i = 0; i < pVCollide->solidCount; i++)
         DestroyCollide(pVCollide->solids[i]);
 
@@ -1520,5 +2315,28 @@ bool Box3DPhysicsCollision::TraceBoxAA(const Ray_t& ray, const CPhysCollide* pCo
 
 void Box3DPhysicsCollision::DuplicateAndScale(vcollide_t* pOut, const vcollide_t* pIn, float flScale)
 {
-    Log_Stub(LOG_VBox3D);
+    if (!pOut)
+        return;
+
+    V_memset(pOut, 0, sizeof(*pOut));
+    if (!pIn || pIn->solidCount <= 0 || !pIn->solids || !IsFinite(flScale) || fabsf(flScale) < FLT_EPSILON)
+        return;
+
+    pOut->solidCount = pIn->solidCount;
+    pOut->solids = new CPhysCollide*[pOut->solidCount];
+    V_memset(pOut->solids, 0, sizeof(CPhysCollide*) * pOut->solidCount);
+    for (int i = 0; i < pOut->solidCount; i++)
+        pOut->solids[i] = CloneScaledCollide(pIn->solids[i], flScale);
+
+    if (pIn->pKeyValues && pIn->descSize >= 0)
+    {
+        pOut->pKeyValues = new char[pIn->descSize + 1];
+        V_memcpy(pOut->pKeyValues, pIn->pKeyValues, pIn->descSize);
+        pOut->pKeyValues[pIn->descSize] = '\0';
+        pOut->descSize = pIn->descSize;
+    }
+    pOut->isPacked = pIn->isPacked;
+#ifdef GAME_ASW_OR_NEWER
+    pOut->pUserData = nullptr;
+#endif
 }
