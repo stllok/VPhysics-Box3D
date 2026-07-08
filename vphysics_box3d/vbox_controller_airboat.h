@@ -96,4 +96,7 @@ private:
     Box3DAirboatPontoon m_AirboatPontoons[kAirboatMaxPontoons];
     Box3DAirboatImpact m_AirboatImpacts[kAirboatMaxPontoons];
     Box3DAirboatState m_AirboatState;
+    unsigned short m_savedChassisCallbackFlags = 0;
+    bool m_savedChassisGravity = true;
+    bool m_hasSavedChassisState = false;
 };

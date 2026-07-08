@@ -57,7 +57,7 @@ Box3DVehicleJeep::~Box3DVehicleJeep()
         // body takes its joints with it, so only destroy joints still alive.
         if (B3_IS_NON_NULL(m_wheelJoints[i]) && b3Joint_IsValid(m_wheelJoints[i]))
         {
-            b3DestroyJoint(m_wheelJoints[i], true);
+            m_pEnv->DestroyJointSafely(m_wheelJoints[i]);
         }
         m_wheelJoints[i] = b3_nullJointId;
     }
@@ -80,6 +80,26 @@ void Box3DVehicleJeep::OnObjectDestroyed(Box3DPhysicsObject* pObject)
     }
 
     Box3DVehicleController::OnObjectDestroyed(pObject);
+}
+
+void Box3DVehicleJeep::SetSpringLength(int wheelIndex, float length)
+{
+    Box3DVehicleController::SetSpringLength(wheelIndex, length);
+    if (wheelIndex < 0 || wheelIndex >= m_wheelCount || m_vehicleData.wheelsPerAxle <= 0)
+        return;
+
+    const int axleIndex = wheelIndex / m_vehicleData.wheelsPerAxle;
+    if (axleIndex < 0 || axleIndex >= m_vehicleData.axleCount)
+        return;
+
+    const float travel = SourceToBox::Distance(Max(m_vehicleData.axles[axleIndex].wheels.springAdditionalLength, 0.0f));
+    const int nFirstWheel = axleIndex * m_vehicleData.wheelsPerAxle;
+    const int nLastWheel = Min(nFirstWheel + m_vehicleData.wheelsPerAxle, m_wheelCount);
+    for (int i = nFirstWheel; i < nLastWheel; i++)
+    {
+        if (B3_IS_NON_NULL(m_wheelJoints[i]) && b3Joint_IsValid(m_wheelJoints[i]))
+            b3WheelJoint_SetSuspensionLimits(m_wheelJoints[i], 0.0f, travel);
+    }
 }
 
 void Box3DVehicleJeep::AttachWheels()
@@ -315,8 +335,8 @@ Box3DVehicleJeep::DriverInputs Box3DVehicleJeep::ProcessDriverInputs(float speed
     {
         m_controls.throttle = 1.0f;
         inputs.throttle = 1.0f;
-        const float speedFraction = engine.maxSpeed > 0.0f
-            ? clamp(fabsf(speed) / SourceToBox::Distance(engine.maxSpeed), 0.0f, 1.0f)
+        const float speedFraction = m_engineMaxSpeed > 0.0f
+            ? clamp(fabsf(speed) / SourceToBox::Distance(m_engineMaxSpeed), 0.0f, 1.0f)
             : 1.0f;
         const float speedFactor = 0.1f + 0.9f * speedFraction;
         const float turnFactor = 1.0f - fabsf(m_controls.steering) * 0.95f;
@@ -399,8 +419,8 @@ void Box3DVehicleJeep::SimulateWheeled(float, float, const DriverInputs& inputs)
         * inputs.torqueMultiplier;
 
     const float topSpeed = SourceToBox::Distance(
-        inputs.boosting && engine.boostMaxSpeed > 0.0f ? engine.boostMaxSpeed : engine.maxSpeed);
-    const float targetLinearSpeed = inputs.throttle >= 0.0f ? topSpeed : -SourceToBox::Distance(engine.maxRevSpeed);
+        inputs.boosting && m_engineBoostMaxSpeed > 0.0f ? m_engineBoostMaxSpeed : m_engineMaxSpeed);
+    const float targetLinearSpeed = inputs.throttle >= 0.0f ? topSpeed : -SourceToBox::Distance(m_engineMaxRevSpeed);
 
     // Reference brake force in N (gravity is m/s^2, mass is kg).
     const float brakeTorqueBase = 0.5f * m_gravityLength * (m_bodyMass + m_totalWheelMass);
@@ -539,8 +559,8 @@ void Box3DVehicleJeep::SimulateRaycast(float dt, float speed, const DriverInputs
         * inputs.torqueMultiplier;
 
     const float topSpeed = SourceToBox::Distance(
-        inputs.boosting && engine.boostMaxSpeed > 0.0f ? engine.boostMaxSpeed : engine.maxSpeed);
-    const bool speedCapped = inputs.throttle >= 0.0f ? speed > topSpeed : speed < -SourceToBox::Distance(engine.maxRevSpeed);
+        inputs.boosting && m_engineBoostMaxSpeed > 0.0f ? m_engineBoostMaxSpeed : m_engineMaxSpeed);
+    const bool speedCapped = inputs.throttle >= 0.0f ? speed > topSpeed : speed < -SourceToBox::Distance(m_engineMaxRevSpeed);
     const float driveDirection = inputs.throttle >= 0.0f ? 1.0f : -1.0f;
 
     // Reference brake force in N.

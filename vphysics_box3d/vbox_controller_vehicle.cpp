@@ -6,6 +6,8 @@
 #include "vbox_object.h"
 #include "vbox_surfaceprops.h"
 
+#include "box3d/collision.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -44,6 +46,35 @@ static bool LocalCollideBounds(const CPhysCollide* pCollide, Vector* pMins, Vect
     *pMins = BoxToSource::Distance(total.lowerBound);
     *pMaxs = BoxToSource::Distance(total.upperBound);
     return true;
+}
+
+static int ShapeMaterialIdAtTriangle(b3ShapeId shape, int triangleIndex)
+{
+    const b3ShapeType type = b3Shape_GetType(shape);
+    int materialIndex = 0;
+
+    if (type == b3_meshShape && triangleIndex >= 0)
+    {
+        const b3Mesh mesh = b3Shape_GetMesh(shape);
+        const uint8* pIndices = mesh.data ? b3GetMeshMaterialIndices(mesh.data) : nullptr;
+        if (pIndices && triangleIndex < mesh.data->triangleCount)
+            materialIndex = pIndices[triangleIndex];
+    }
+    else if (type == b3_heightShape && triangleIndex >= 0)
+    {
+        const b3HeightFieldData* pHeightField = b3Shape_GetHeightField(shape);
+        const uint8* pIndices = pHeightField ? b3GetHeightFieldMaterialIndices(pHeightField) : nullptr;
+        const int nCellCount = pHeightField ? (pHeightField->columnCount - 1) * (pHeightField->rowCount - 1) : 0;
+        const int nCellIndex = triangleIndex >> 1;
+        if (pIndices && nCellIndex >= 0 && nCellIndex < nCellCount)
+            materialIndex = pIndices[nCellIndex];
+    }
+
+    const int nMaterialCount = b3Shape_GetMeshMaterialCount(shape);
+    if (nMaterialCount <= 0)
+        return static_cast<int>(b3Shape_GetSurfaceMaterial(shape).userMaterialId);
+    materialIndex = clamp(materialIndex, 0, nMaterialCount - 1);
+    return static_cast<int>(b3Shape_GetMeshSurfaceMaterial(shape, materialIndex).userMaterialId);
 }
 
 Box3DVehicleController::Box3DVehicleController(
@@ -135,6 +166,8 @@ IPhysicsObject* Box3DVehicleController::GetWheel(int index)
 void Box3DVehicleController::SetWheelFriction(int wheelIndex, float friction)
 {
     if (wheelIndex < 0 || wheelIndex >= VEHICLE_MAX_WHEEL_COUNT)
+        return;
+    if (!IsFinite(friction))
         return;
     if (IsRaycastVehicle())
     {
@@ -332,7 +365,7 @@ Box3DPhysicsObject* Box3DVehicleController::CreateWheel(int wheelIndex, const Ve
         b3BodyId wheelBody = pWheel->GetBodyID();
         b3Body_SetBullet(wheelBody, true);
 
-        if (axle.wheels.frictionScale > 0.0f)
+        if (IsFinite(axle.wheels.frictionScale) && axle.wheels.frictionScale > 0.0f)
         {
             b3ShapeId shapes[1];
             if (b3Body_GetShapes(wheelBody, shapes, 1) > 0)
@@ -381,15 +414,18 @@ bool Box3DVehicleController::WheelContact(int wheelIndex, b3Pos* pPoint, int* pS
                 continue;
 
             b3BodyId bodyA = b3Shape_GetBody(data.shapeIdA);
+            b3BodyId bodyB = b3Shape_GetBody(data.shapeIdB);
+            const bool wheelIsA = B3_ID_EQUALS(bodyA, wheelBody);
             if (pPoint)
             {
-                *pPoint = b3OffsetPos(b3Body_GetWorldCenter(bodyA), manifold.points[0].anchorA);
+                const b3BodyId wheelContactBody = wheelIsA ? bodyA : bodyB;
+                const b3Vec3 wheelAnchor = wheelIsA ? manifold.points[0].anchorA : manifold.points[0].anchorB;
+                *pPoint = b3OffsetPos(b3Body_GetWorldCenter(wheelContactBody), wheelAnchor);
             }
             if (pSurfaceProps)
             {
-                const bool wheelIsA = B3_ID_EQUALS(bodyA, wheelBody);
                 b3ShapeId otherShape = wheelIsA ? data.shapeIdB : data.shapeIdA;
-                *pSurfaceProps = static_cast<int>(b3Shape_GetSurfaceMaterial(otherShape).userMaterialId);
+                *pSurfaceProps = ShapeMaterialIdAtTriangle(otherShape, manifold.points[0].triangleIndex);
             }
             return true;
         }
@@ -412,10 +448,11 @@ void Box3DVehicleController::VehicleDataReload()
     {
         m_torqueScale /= totalTorqueDistribution;
     }
-    // input speed is in miles/hour.  Convert to m/s (box3d runs in metres)
-    m_vehicleData.engine.maxSpeed = m_vehicleData.engine.maxSpeed * kMphToInchesPerSecond;
-    m_vehicleData.engine.maxRevSpeed = m_vehicleData.engine.maxRevSpeed * kMphToInchesPerSecond;
-    m_vehicleData.engine.boostMaxSpeed = m_vehicleData.engine.boostMaxSpeed * kMphToInchesPerSecond;
+    // Authored input speed is mph. Keep m_vehicleData raw so VehicleDataReload is idempotent and
+    // GetVehicleParamsForChange callers do not see already-converted units.
+    m_engineMaxSpeed = m_vehicleData.engine.maxSpeed * kMphToInchesPerSecond;
+    m_engineMaxRevSpeed = m_vehicleData.engine.maxRevSpeed * kMphToInchesPerSecond;
+    m_engineBoostMaxSpeed = m_vehicleData.engine.boostMaxSpeed * kMphToInchesPerSecond;
 }
 
 void Box3DVehicleController::InitVehicleData(const vehicleparams_t& params)
@@ -424,8 +461,18 @@ void Box3DVehicleController::InitVehicleData(const vehicleparams_t& params)
     VehicleDataReload();
 }
 
-void Box3DVehicleController::SetSpringLength(int, float)
+void Box3DVehicleController::SetSpringLength(int wheelIndex, float length)
 {
+    if (wheelIndex < 0 || wheelIndex >= m_wheelCount || m_vehicleData.wheelsPerAxle <= 0 || !IsFinite(length))
+        return;
+
+    const int axleIndex = wheelIndex / m_vehicleData.wheelsPerAxle;
+    if (axleIndex < 0 || axleIndex >= m_vehicleData.axleCount)
+        return;
+
+    m_vehicleData.axles[axleIndex].wheels.springAdditionalLength = Max(length, 0.0f);
+    if (m_pCarBody)
+        m_pCarBody->Wake();
 }
 
 void Box3DVehicleController::CastWheel(

@@ -89,6 +89,11 @@ Box3DVehicleAirboat::Box3DVehicleAirboat(
 
 Box3DVehicleAirboat::~Box3DVehicleAirboat()
 {
+    if (m_hasSavedChassisState && m_pCarBody)
+    {
+        m_pCarBody->EnableGravity(m_savedChassisGravity);
+        m_pCarBody->SetCallbackFlags(m_savedChassisCallbackFlags);
+    }
 }
 
 float Box3DVehicleAirboat::UpdateBooster(float)
@@ -131,6 +136,12 @@ void Box3DVehicleAirboat::AttachWheels()
 
     if (m_pCarBody)
     {
+        if (!m_hasSavedChassisState)
+        {
+            m_savedChassisGravity = m_pCarBody->IsGravityEnabled();
+            m_savedChassisCallbackFlags = m_pCarBody->GetCallbackFlags();
+            m_hasSavedChassisState = true;
+        }
         // The hull integrates its own gravity/buoyancy each step, so turn off
         // box3d gravity and the game's fluid simulation on it.
         m_pCarBody->EnableGravity(false);
@@ -151,7 +162,7 @@ void Box3DVehicleAirboat::Update(float, vehicle_controlparams_t& controls)
 
     float flThrottle = controls.throttle;
     const float flAbsSpeed = fabsf(m_currentState.speed);
-    const float flMaxSpeed = Max(m_vehicleData.engine.maxSpeed, 1.0f);
+    const float flMaxSpeed = Max(m_engineMaxSpeed, 1.0f);
     if (flThrottle > 0.0f && flAbsSpeed > flMaxSpeed)
     {
         const float flFrac = flAbsSpeed / flMaxSpeed;
@@ -159,7 +170,7 @@ void Box3DVehicleAirboat::Update(float, vehicle_controlparams_t& controls)
             flThrottle = 0.0f;
         flThrottle *= 0.1f;
     }
-    if (flThrottle < 0.0f && flAbsSpeed > m_vehicleData.engine.maxRevSpeed)
+    if (flThrottle < 0.0f && flAbsSpeed > m_engineMaxRevSpeed)
         flThrottle *= 0.1f;
 
     if (fabsf(flThrottle) < 0.01f)

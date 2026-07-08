@@ -108,6 +108,9 @@ protected:
     float m_totalWheelMass;
     float m_gravityLength;
     float m_torqueScale;
+    float m_engineMaxSpeed;
+    float m_engineMaxRevSpeed;
+    float m_engineBoostMaxSpeed;
     Box3DPhysicsObject* m_pWheels[VEHICLE_MAX_WHEEL_COUNT];
     Vector m_wheelPosition_Bs[VEHICLE_MAX_WHEEL_COUNT];
     Vector m_tracePosition_Bs[VEHICLE_MAX_WHEEL_COUNT];

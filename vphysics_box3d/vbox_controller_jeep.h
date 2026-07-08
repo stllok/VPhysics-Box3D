@@ -15,6 +15,7 @@ public:
     // IPhysicsVehicleController
     void Update(float dt, vehicle_controlparams_t& controls) override;
     float UpdateBooster(float dt) override;
+    void SetSpringLength(int wheelIndex, float length) override;
 
 private:
     struct DriverInputs
