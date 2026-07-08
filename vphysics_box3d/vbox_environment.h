@@ -173,6 +173,7 @@ public:
     {
         return m_WorldId;
     }
+    bool HasConstraintForObject(const Box3DPhysicsObject* pObject, bool bExternalOnly) const;
     // IVP's PI/2 rad/tick angular cap, recomputed each step from the tick length. Objects clamp their
     // read-back velocity to the same value so the game never sees a "crazy angular velocity".
     float GetMaxAngularVelocity() const
@@ -191,6 +192,7 @@ public:
     {
         return m_pCollisionSolver;
     }
+    void DestroyJointSafely(b3JointId jointId);
     IPhysicsObject* CreateObject(
         const CPhysCollide* pCollisionModel, int materialIndex, const Vector& position, const QAngle& angles,
         objectparams_t* pParams, bool bStatic);
@@ -213,6 +215,7 @@ private:
     void SolvePulleys(float dt);
 
     void DeleteObject(Box3DPhysicsObject* pObject);
+    void CleanupDeadJoints();
 
     // Track a new constraint, wire it to its group, store its break params, and build its joint (unless
     // deferred to the group).
@@ -223,6 +226,7 @@ private:
     b3WorldId m_WorldId;
 
     Vector m_vecGravity = vec3_origin;
+    Vector m_vecAlternateGravity = vec3_origin;
     float m_flAirDensity = 2.0f;
     float m_flSimulationTimestep = 1.0f / 60.0f;
     float m_flLastStepTime = 1.0f / 60.0f;
@@ -244,7 +248,9 @@ private:
     mutable CUtlVector<Box3DPhysicsObject*> m_ActiveObjects;
     CUtlVector<Box3DPhysicsObject*> m_DeadObjects;
     CUtlVector<CPhysCollide*> m_DeadObjectCollides;
+    CUtlVector<b3JointId> m_DeadJoints;
     bool m_bDeleteQueueEnabled = false;
+    bool m_bQuickDelete = false;
 
     CUtlVector<Box3DPhysicsShadowController*> m_ShadowControllers;
     CUtlVector<Box3DPhysicsMotionController*> m_MotionControllers;
@@ -258,4 +264,5 @@ private:
     CUtlVector<Box3DPhysicsConstraint*> m_Pulleys; // subset of m_Constraints solved per-step (no native joint)
     CUtlVector<Box3DPhysicsSpring*> m_Springs;
     physics_performanceparams_t m_PerformanceParams;
+    physics_stats_t m_Stats = {};
 };

@@ -49,8 +49,42 @@ struct Box3DSavedObjectState
     bool bDragEnabled = false;
     bool bAsleep = false;
     bool bTrigger = false;
+    bool bHinged = false;
 };
-static constexpr int kBox3DSaveVersion = 1;
+
+struct Box3DSavedObjectStateV1
+{
+    Vector position = vec3_origin;
+    QAngle angles = vec3_angle;
+    Vector velocity = vec3_origin;
+    Vector angularVelocity = vec3_origin;
+    Vector massCenter = vec3_origin;
+    Vector inertia = vec3_origin;
+    float mass = 0.0f;
+    float sphereRadius = 0.0f;
+    float linearDamping = 0.0f;
+    float angularDamping = 0.0f;
+    float dragCoefficient = 0.0f;
+    float angularDragCoefficient = 0.0f;
+    float volume = 0.0f;
+    float buoyancyRatio = 1.0f;
+    int materialIndex = 0;
+    uint contents = 0;
+    uint32 collisionHints = 0;
+    uint16 gameFlags = 0;
+    uint16 gameIndex = 0;
+    uint16 callbackFlags = 0;
+    bool bStatic = false;
+    bool bMotionEnabled = true;
+    bool bGravityEnabled = true;
+    bool bCollisionEnabled = true;
+    bool bDragEnabled = false;
+    bool bAsleep = false;
+    bool bTrigger = false;
+};
+static_assert(sizeof(Box3DSavedObjectStateV1) <= sizeof(Box3DSavedObjectState));
+static constexpr int kBox3DSaveVersion1 = 1;
+static constexpr int kBox3DSaveVersion = 2;
 
 class Box3DPhysicsObject final : public IPhysicsObjectInterface
 {
@@ -243,11 +277,10 @@ public:
         m_bLastAwake = bAwake;
     }
 
-    // Per-pair collision-event rate limit (IVP's deltaCollisionTime): last sim time this object fired an
-    // event and the partner's unique id. Ids never repeat, so a reallocated partner can't false-match.
-    float m_flLastCollisionTime = -1000.0f;
-    uint64 m_nLastCollisionPartnerId = 0;
-    uint64 m_nUniqueId = 0;
+    // Josh:
+    // Always put m_pGameData first. Some games that will remain un-named offset by the
+    // vtable to get to this instead of calling GetGameData().
+    void* m_pGameData = nullptr;
 
     // Pre-step velocity snapshot, faked back in during PreCollision so the game's pre/post velocity
     // delta (impact damage) is real.
@@ -280,6 +313,12 @@ public:
         m_CollisionCache[partnerId] = ((uint64)partnerEpoch << 1) | (collide ? 1ull : 0ull);
     }
 
+    // Per-pair collision-event rate limit (IVP's deltaCollisionTime): last sim time this object fired an
+    // event and the partner's unique id. Ids never repeat, so a reallocated partner can't false-match.
+    float m_flLastCollisionTime = -1000.0f;
+    uint64 m_nLastCollisionPartnerId = 0;
+    uint64 m_nUniqueId = 0;
+
     // Bumped when the game changes this object's collision rules, staling cached decisions that name it as a
     // partner. Written only from RecheckCollisionFilter (main thread, outside the step), so no lock needed.
     uint32 m_nRulesEpoch = 1;
@@ -291,10 +330,6 @@ private:
     // Recreate this body's shapes as sensors (trigger) or normal solid shapes.
     void RebuildShapes(bool asSensor);
 
-    // Josh:
-    // Always put m_pGameData first. Some games that will remain un-named offset by the
-    // vtable to get to this instead of calling GetGameData().
-    void* m_pGameData = nullptr;
     const char* m_pName = "NoName";
 
     uint16 m_gameFlags = 0;
@@ -308,6 +343,7 @@ private:
     bool m_bGravityEnabled = true;
     bool m_bCollisionEnabled = true;
     bool m_bDragEnabled = false;
+    bool m_bHinged = false;
 
     int m_materialIndex = 0;
     uint m_contents = CONTENTS_SOLID;
@@ -334,6 +370,8 @@ private:
     // Box3D reports zero mass for static bodies, so cache what the game set.
     float m_flCachedMass = 0.0f;
     float m_flCachedInvMass = 0.0f;
+    Vector m_vecCachedInertia = vec3_origin;
+    Vector m_vecRequestedInertia = vec3_origin;
 
     const CPhysCollide* m_pCollide = nullptr;
 

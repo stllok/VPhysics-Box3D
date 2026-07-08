@@ -47,16 +47,50 @@ namespace
     // Apply a Source surface's friction/bounce/density to a shape. Box3D combines both shapes on contact.
     void ApplyMaterialToShape(b3ShapeDef& shapeDef, int materialIndex)
     {
+        shapeDef.baseMaterial.userMaterialId = materialIndex;
         surfacedata_t* pSurface = Box3DPhysicsSurfaceProps::GetInstance().GetSurfaceData(materialIndex);
         if (!pSurface)
             return;
 
-        shapeDef.baseMaterial.friction = Max(pSurface->physics.friction, 0.0f);
+        shapeDef.baseMaterial.friction = IsFinite(pSurface->physics.friction) ? Max(pSurface->physics.friction, 0.0f) : 0.0f;
         // Raw surfaceprop elasticity (can be far above 1, e.g. Metal_bouncy = 1000); the combined
         // product is clamped in Box3DRestitutionCombine, matching IVP's get_elasticity.
-        shapeDef.baseMaterial.restitution = pSurface->physics.elasticity;
-        if (pSurface->physics.density > 0.0f)
+        shapeDef.baseMaterial.restitution = IsFinite(pSurface->physics.elasticity) ? pSurface->physics.elasticity : 0.0f;
+        if (IsFinite(pSurface->physics.density) && pSurface->physics.density > 0.0f)
             shapeDef.density = pSurface->physics.density; // kg/m^3 in both, geometry is in metres
+    }
+
+    void ApplyWorldMaterialToBoxMaterial(b3SurfaceMaterial& material, int materialIndex)
+    {
+        Box3DPhysicsSurfaceProps& props = Box3DPhysicsSurfaceProps::GetInstance();
+        material.userMaterialId = props.GetWorldSurfaceIndex(materialIndex);
+        surfacedata_t* pSurface = props.GetWorldSurfaceData(materialIndex);
+        if (!pSurface)
+            return;
+
+        material.friction = IsFinite(pSurface->physics.friction) ? Max(pSurface->physics.friction, 0.0f) : 0.0f;
+        material.restitution = IsFinite(pSurface->physics.elasticity) ? pSurface->physics.elasticity : 0.0f;
+    }
+
+    void ApplyWorldMeshMaterials(b3ShapeDef& shapeDef, const b3MeshData* pMesh, CUtlVector<b3SurfaceMaterial>& materials)
+    {
+        if (!pMesh)
+            return;
+
+        if (pMesh->materialCount <= 1)
+        {
+            ApplyWorldMaterialToBoxMaterial(shapeDef.baseMaterial, 0);
+            return;
+        }
+
+        materials.SetCount(pMesh->materialCount);
+        for (int i = 0; i < pMesh->materialCount; i++)
+        {
+            materials[i] = b3DefaultSurfaceMaterial();
+            ApplyWorldMaterialToBoxMaterial(materials[i], i);
+        }
+        shapeDef.materials = materials.Base();
+        shapeDef.materialCount = materials.Count();
     }
 
     // IVP combines both surfaces' coefficients as a product; Box3D defaults to
@@ -186,13 +220,149 @@ namespace
     }
     // Existing pairs, every step: cheap lock-free checks only. The custom filter already decided this pair
     // when it formed, and it persists, so the game solver is not re-asked here.
-    bool Box3DPreSolve(b3ShapeId a, b3ShapeId b, b3Pos, b3Vec3, void*)
+    bool Box3DPreSolve(b3ShapeId a, b3ShapeId b, b3Pos, b3Vec3, void* ctx)
     {
         Box3DPhysicsObject* pA = ObjectFromShapeFast(a);
         Box3DPhysicsObject* pB = ObjectFromShapeFast(b);
         if (!pA || !pB)
             return true;
-        return LocalShouldCollide(pA, pB);
+        if (!LocalShouldCollide(pA, pB))
+            return false;
+        return ShapesCollide(ctx, a, b);
+    }
+
+    b3Pos ToBoxPosition(const Vector& value)
+    {
+        const b3Vec3 v = SourceToBox::Distance(value);
+        return b3Pos{ v.x, v.y, v.z };
+    }
+
+    bool TraceTypeAllowsObject(IPhysicsTraceFilter* pFilter, Box3DPhysicsObject* pObject)
+    {
+        if (!pFilter)
+            return true;
+
+        switch (pFilter->GetTraceType())
+        {
+        case VPHYSICS_TRACE_STATIC_ONLY:
+            return pObject->IsStatic();
+        case VPHYSICS_TRACE_MOVING_ONLY:
+            return !pObject->IsStatic();
+        default:
+            return true;
+        }
+    }
+
+    bool IsSupportedBox3DSaveVersion(int version)
+    {
+        return version == kBox3DSaveVersion || version == kBox3DSaveVersion1;
+    }
+
+    void ApplySaveVersionDefaults(Box3DSavedObjectState& state, int version)
+    {
+        if (version == kBox3DSaveVersion1)
+            state.bHinged = false;
+    }
+
+    size_t SaveStateSizeForVersion(int version)
+    {
+        if (version == kBox3DSaveVersion1)
+            return sizeof(Box3DSavedObjectStateV1);
+        return sizeof(Box3DSavedObjectState);
+    }
+
+    void ReadSaveStateForVersion(Box3DSavedObjectState& state, IRestore* pRestore, int version)
+    {
+        state = {};
+        if (version == kBox3DSaveVersion1)
+        {
+            Box3DSavedObjectStateV1 oldState = {};
+            pRestore->ReadData(reinterpret_cast<char*>(&oldState), sizeof(oldState), sizeof(oldState));
+            V_memcpy(&state, &oldState, Min(sizeof(state), sizeof(oldState)));
+        }
+        else
+        {
+            pRestore->ReadData(reinterpret_cast<char*>(&state), sizeof(state), sizeof(state));
+        }
+        ApplySaveVersionDefaults(state, version);
+    }
+
+    void CopySaveStateForVersion(Box3DSavedObjectState& state, const unsigned char* p, int version)
+    {
+        state = {};
+        if (version == kBox3DSaveVersion1)
+            V_memcpy(&state, p, Min(sizeof(state), sizeof(Box3DSavedObjectStateV1)));
+        else
+            V_memcpy(&state, p, sizeof(state));
+        ApplySaveVersionDefaults(state, version);
+    }
+
+    struct WorldTraceRayContext
+    {
+        IPhysicsTraceFilter* pFilter = nullptr;
+        trace_t* pTrace = nullptr;
+        Vector vecStart = vec3_origin;
+        Vector vecDelta = vec3_origin;
+        unsigned int fMask = 0;
+    };
+
+    float WorldTraceRayCallback(
+        b3ShapeId shapeId, b3Pos, b3Vec3 normal, float fraction, uint64_t, int, int, void* pContext)
+    {
+        WorldTraceRayContext* pState = static_cast<WorldTraceRayContext*>(pContext);
+        Box3DPhysicsObject* pObject = ObjectFromShapeFast(shapeId);
+        if (!pObject || b3Shape_IsSensor(shapeId) || !pObject->IsCollisionEnabled())
+            return -1.0f;
+
+        const int contents = pObject->GetContents();
+        if ((contents & pState->fMask) == 0)
+            return -1.0f;
+        if (!TraceTypeAllowsObject(pState->pFilter, pObject))
+            return -1.0f;
+        if (pState->pFilter && !pState->pFilter->ShouldHitObject(pObject, pState->fMask))
+            return -1.0f;
+        if (fraction >= pState->pTrace->fraction)
+            return pState->pTrace->fraction;
+
+        Vector vecNormal = BoxToSource::Unitless(normal);
+        if (vecNormal.LengthSqr() < 1e-6f)
+            vecNormal = pState->vecDelta.LengthSqr() > 1e-6f ? -pState->vecDelta : Vector(0.0f, 0.0f, 1.0f);
+        VectorNormalize(vecNormal);
+
+        pState->pTrace->fraction = fraction;
+        pState->pTrace->endpos = pState->vecStart + pState->vecDelta * fraction;
+        pState->pTrace->plane.normal = vecNormal;
+        pState->pTrace->plane.dist = DotProduct(pState->pTrace->endpos, vecNormal);
+        pState->pTrace->contents = contents;
+        pState->pTrace->startsolid = fraction == 0.0f;
+        return fraction;
+    }
+
+    bool WorldSweepOverlapCallback(b3ShapeId shapeId, void* pContext)
+    {
+        WorldTraceRayContext* pState = static_cast<WorldTraceRayContext*>(pContext);
+        Box3DPhysicsObject* pObject = ObjectFromShapeFast(shapeId);
+        if (!pObject || b3Shape_IsSensor(shapeId) || !pObject->IsCollisionEnabled())
+            return true;
+
+        const int contents = pObject->GetContents();
+        if ((contents & pState->fMask) == 0)
+            return true;
+        if (!TraceTypeAllowsObject(pState->pFilter, pObject))
+            return true;
+        if (pState->pFilter && !pState->pFilter->ShouldHitObject(pObject, pState->fMask))
+            return true;
+
+        Vector vecNormal = pState->vecDelta.LengthSqr() > 1e-6f ? -pState->vecDelta : Vector(0.0f, 0.0f, 1.0f);
+        VectorNormalize(vecNormal);
+        pState->pTrace->fraction = 0.0f;
+        pState->pTrace->endpos = pState->vecStart;
+        pState->pTrace->plane.normal = vecNormal;
+        pState->pTrace->plane.dist = DotProduct(pState->pTrace->endpos, vecNormal);
+        pState->pTrace->contents = contents;
+        pState->pTrace->startsolid = true;
+        pState->pTrace->allsolid = true;
+        return false;
     }
 } // namespace
 
@@ -208,8 +378,9 @@ Box3DPhysicsEnvironment::Box3DPhysicsEnvironment()
     def.enableContinuous = true;
     // Penetration push-out cap: gentler than Box3D's 3 m/s default, but not so low ragdoll limbs wedge.
     def.contactSpeed = SourceToBox::Distance(100.0f);
-    // workerCount > 1 with no task callbacks runs Box3D's built-in scheduler; physical cores only, HT hurts.
-    def.workerCount = (uint32_t)clamp(Box3DPhysicalCores(GetCPUInformation()), 1, B3_MAX_WORKERS);
+    // Game collision callbacks are Source-side contracts. Box3D custom filters can run on built-in workers,
+    // so keep the world serial until pair rules are precomputed outside callbacks.
+    def.workerCount = 1;
     m_WorldId = b3CreateWorld(&def);
 
     // Match IVP's product combine rule for both coefficients (not Box3D's max/sqrt defaults).
@@ -239,6 +410,8 @@ IVPhysicsDebugOverlay* Box3DPhysicsEnvironment::GetDebugOverlay(void)
 
 void Box3DPhysicsEnvironment::SetGravity(const Vector& gravityVector)
 {
+    if (!gravityVector.IsValid())
+        return;
     m_vecGravity = gravityVector;
     b3World_SetGravity(m_WorldId, SourceToBox::Distance(gravityVector));
 }
@@ -250,7 +423,8 @@ void Box3DPhysicsEnvironment::GetGravity(Vector* pGravityVector) const
 
 void Box3DPhysicsEnvironment::SetAirDensity(float density)
 {
-    m_flAirDensity = density;
+    if (IsFinite(density))
+        m_flAirDensity = Max(density, 0.0f);
 }
 
 float Box3DPhysicsEnvironment::GetAirDensity() const
@@ -262,6 +436,9 @@ IPhysicsObject* Box3DPhysicsEnvironment::CreateObject(
     const CPhysCollide* pCollisionModel, int materialIndex, const Vector& position, const QAngle& angles,
     objectparams_t* pParams, bool bStatic)
 {
+    if (!position.IsValid() || !angles.IsValid())
+        return nullptr;
+
     b3BodyDef bodyDef = b3DefaultBodyDef();
     bodyDef.type = bStatic ? b3_staticBody : b3_dynamicBody;
     bodyDef.position = SourceToBox::Distance(position);
@@ -293,10 +470,17 @@ IPhysicsObject* Box3DPhysicsEnvironment::CreateObject(
         }
 
         if (pCollisionModel->m_pMesh)
-            b3CreateMeshShape(bodyId, &shapeDef, pCollisionModel->m_pMesh, b3Vec3{ 1.0f, 1.0f, 1.0f });
+        {
+            b3ShapeDef meshShapeDef = shapeDef;
+            CUtlVector<b3SurfaceMaterial> meshMaterials;
+            if (bStatic)
+                ApplyWorldMeshMaterials(meshShapeDef, pCollisionModel->m_pMesh, meshMaterials);
+            b3CreateMeshShape(bodyId, &meshShapeDef, pCollisionModel->m_pMesh, b3Vec3{ 1.0f, 1.0f, 1.0f });
+        }
     }
 
-    if (!bStatic && pParams && pParams->massCenterOverride && *pParams->massCenterOverride != vec3_origin)
+    if (!bStatic && pParams && pParams->massCenterOverride && pParams->massCenterOverride->IsValid()
+        && *pParams->massCenterOverride != vec3_origin)
     {
         b3MassData massData = b3Body_GetMassData(bodyId);
         massData.center = SourceToBox::Distance(*pParams->massCenterOverride);
@@ -304,7 +488,13 @@ IPhysicsObject* Box3DPhysicsEnvironment::CreateObject(
     }
 
     Box3DPhysicsObject* pObject = new Box3DPhysicsObject(bodyId, this, bStatic, materialIndex, pCollisionModel, pParams);
+    if (pParams && !pParams->enableCollisions)
+        pObject->EnableCollisions(false);
     m_Objects.AddToTail(pObject);
+#if GAME_GMOD
+    if (m_pGModObjectEvent)
+        m_pGModObjectEvent->ObjectCreated(pObject);
+#endif
     return pObject;
 }
 
@@ -325,6 +515,9 @@ IPhysicsObject* Box3DPhysicsEnvironment::CreatePolyObjectStatic(
 IPhysicsObject* Box3DPhysicsEnvironment::CreateSphereObject(
     float radius, int materialIndex, const Vector& position, const QAngle& angles, objectparams_t* pParams, bool isStatic)
 {
+    if (!IsFinite(radius) || radius <= 0.0f || !position.IsValid() || !angles.IsValid())
+        return nullptr;
+
     b3BodyDef bodyDef = b3DefaultBodyDef();
     bodyDef.type = isStatic ? b3_staticBody : b3_dynamicBody;
     bodyDef.position = SourceToBox::Distance(position);
@@ -345,8 +538,14 @@ IPhysicsObject* Box3DPhysicsEnvironment::CreateSphereObject(
     b3CreateSphereShape(bodyId, &shapeDef, &sphere);
 
     Box3DPhysicsObject* pObject = new Box3DPhysicsObject(bodyId, this, isStatic, materialIndex, nullptr, pParams);
+    if (pParams && !pParams->enableCollisions)
+        pObject->EnableCollisions(false);
     pObject->SetSphereRadius(radius);
     m_Objects.AddToTail(pObject);
+#if GAME_GMOD
+    if (m_pGModObjectEvent)
+        m_pGModObjectEvent->ObjectCreated(pObject);
+#endif
     return pObject;
 }
 
@@ -358,10 +557,7 @@ void Box3DPhysicsEnvironment::DestroyObject(IPhysicsObject* pObject)
     Box3DPhysicsObject* pBoxObject = static_cast<Box3DPhysicsObject*>(pObject);
 
     if (pBoxObject->GetCallbackFlags() & CALLBACK_MARKED_FOR_DELETE)
-    {
-        AssertMsg(false, "Object deleted twice.\n");
         return;
-    }
 
     // Drop any controllers referencing this object while its body is still valid.
     pBoxObject->RemoveShadowController();
@@ -379,11 +575,17 @@ void Box3DPhysicsEnvironment::DestroyObject(IPhysicsObject* pObject)
         m_VehicleControllers[i]->OnObjectDestroyed(pBoxObject);
     // Break constraints/springs on this object so their getters can't return a freed pointer, and report
     // ConstraintBroken like IVP (the game defers entity removal, so firing in-loop is safe).
-    for (int i = 0; i < m_Constraints.Count(); i++)
+    CUtlVector<Box3DPhysicsConstraint*> constraints;
+    constraints.CopyArray(m_Constraints.Base(), m_Constraints.Count());
+    for (int i = 0; i < constraints.Count(); i++)
     {
-        const bool bBroke = m_Constraints[i]->NotifyObjectDestroyed(pBoxObject);
+        Box3DPhysicsConstraint* pConstraint = constraints[i];
+        if (m_Constraints.Find(pConstraint) == m_Constraints.InvalidIndex())
+            continue;
+
+        const bool bBroke = pConstraint->NotifyObjectDestroyed(pBoxObject);
         if (bBroke && m_pConstraintEvent && m_bConstraintNotify)
-            m_pConstraintEvent->ConstraintBroken(m_Constraints[i]);
+            m_pConstraintEvent->ConstraintBroken(pConstraint);
     }
     for (int i = 0; i < m_Springs.Count(); i++)
         m_Springs[i]->NotifyObjectDestroyed(pBoxObject);
@@ -391,10 +593,14 @@ void Box3DPhysicsEnvironment::DestroyObject(IPhysicsObject* pObject)
     m_ActiveObjects.FindAndRemove(pBoxObject);
 
     pBoxObject->SetCallbackFlags(pBoxObject->GetCallbackFlags() | CALLBACK_MARKED_FOR_DELETE);
+#if GAME_GMOD
+    if (m_pGModObjectEvent)
+        m_pGModObjectEvent->ObjectDestroyed(pBoxObject);
+#endif
 
     // While the delete queue is on, keep the wrapper alive and in m_Objects so pending references stay
     // valid -- GMod validates queued damage-event inflictors by GetObjectList() membership.
-    if (m_bInSimulation || m_bDeleteQueueEnabled)
+    if (m_bInSimulation || (m_bDeleteQueueEnabled && !m_bQuickDelete))
     {
         m_DeadObjects.AddToTail(pBoxObject);
         return;
@@ -408,6 +614,26 @@ void Box3DPhysicsEnvironment::DeleteObject(Box3DPhysicsObject* pObject)
     m_Objects.FindAndRemove(pObject);
     b3DestroyBody(pObject->GetBodyID());
     delete pObject;
+}
+
+void Box3DPhysicsEnvironment::DestroyJointSafely(b3JointId jointId)
+{
+    if (!b3Joint_IsValid(jointId))
+        return;
+    if (m_bInSimulation)
+    {
+        m_DeadJoints.AddToTail(jointId);
+        return;
+    }
+    b3DestroyJoint(jointId, true);
+}
+
+void Box3DPhysicsEnvironment::CleanupDeadJoints()
+{
+    for (int i = 0; i < m_DeadJoints.Count(); i++)
+        if (b3Joint_IsValid(m_DeadJoints[i]))
+            b3DestroyJoint(m_DeadJoints[i], true);
+    m_DeadJoints.RemoveAll();
 }
 
 IPhysicsFluidController* Box3DPhysicsEnvironment::CreateFluidController(IPhysicsObject* pFluidObject, fluidparams_t* pParams)
@@ -510,7 +736,7 @@ void Box3DPhysicsEnvironment::SetCollisionSolver(IPhysicsCollisionSolver* pSolve
 
 void Box3DPhysicsEnvironment::Simulate(float deltaTime)
 {
-    if (deltaTime <= 0.0f)
+    if (!IsFinite(deltaTime) || deltaTime <= 0.0f)
         return;
 
     m_flLastStepTime = deltaTime;
@@ -565,10 +791,17 @@ void Box3DPhysicsEnvironment::Simulate(float deltaTime)
             pObject->ApplyAirDrag(m_flAirDensity, deltaTime);
     }
 
-    b3World_SetContactTuning(
-        m_WorldId, vbox_contact_hertz.GetFloat(), vbox_contact_damping.GetFloat(),
-        SourceToBox::Distance(vbox_contact_speed.GetFloat()));
-    b3World_Step(m_WorldId, deltaTime, vbox_substeps.GetInt());
+    float flContactHertz = vbox_contact_hertz.GetFloat();
+    float flContactDamping = vbox_contact_damping.GetFloat();
+    float flContactSpeed = vbox_contact_speed.GetFloat();
+    if (!IsFinite(flContactHertz) || flContactHertz <= 0.0f)
+        flContactHertz = 240.0f;
+    if (!IsFinite(flContactDamping) || flContactDamping < 0.0f)
+        flContactDamping = 10.0f;
+    if (!IsFinite(flContactSpeed) || flContactSpeed < 0.0f)
+        flContactSpeed = 400.0f;
+    b3World_SetContactTuning(m_WorldId, flContactHertz, flContactDamping, SourceToBox::Distance(flContactSpeed));
+    b3World_Step(m_WorldId, deltaTime, Max(vbox_substeps.GetInt(), 1));
 
     // Wake/sleep transitions -> ObjectWake/ObjectSleep (prop sleep networking and game logic).
     for (int i = 0; i < m_Objects.Count(); i++)
@@ -624,6 +857,7 @@ void Box3DPhysicsEnvironment::Simulate(float deltaTime)
     }
 
     m_bInSimulation = false;
+    CleanupDeadJoints();
 
     // The game's PostSimulationFrame processes deferred touch/damage and expects IsInSimulation() false.
     if (m_pCollisionEvent)
@@ -753,8 +987,8 @@ void Box3DPhysicsEnvironment::DrainContactEvents()
         vcollisionevent_t event = {};
         event.pObjects[0] = p1;
         event.pObjects[1] = p2;
-        event.surfaceProps[0] = p1->GetMaterialIndex();
-        event.surfaceProps[1] = p2->GetMaterialIndex();
+        event.surfaceProps[0] = (int)hit.userMaterialIdA;
+        event.surfaceProps[1] = (int)hit.userMaterialIdB;
         event.isCollision = bIsCollision;
         event.isShadowCollision = bIsShadowCollision;
         event.deltaCollisionTime = flDeltaCollisionTime;
@@ -901,8 +1135,7 @@ void Box3DPhysicsEnvironment::ResetSimulationClock()
 
 float Box3DPhysicsEnvironment::GetNextFrameTime() const
 {
-    Log_Stub(LOG_VBox3D);
-    return 0.0f;
+    return m_flSimulationClock + m_flSimulationTimestep;
 }
 
 void Box3DPhysicsEnvironment::SetCollisionEventHandler(IPhysicsCollisionEvent* pCollisionEvents)
@@ -922,7 +1155,7 @@ void Box3DPhysicsEnvironment::SetConstraintEventHandler(IPhysicsConstraintEvent*
 
 void Box3DPhysicsEnvironment::SetQuickDelete(bool bQuick)
 {
-    Log_Stub(LOG_VBox3D);
+    m_bQuickDelete = bQuick;
 }
 
 int Box3DPhysicsEnvironment::GetActiveObjectCount() const
@@ -945,12 +1178,14 @@ const IPhysicsObject** Box3DPhysicsEnvironment::GetObjectList(int* pOutputObject
 
 bool Box3DPhysicsEnvironment::TransferObject(IPhysicsObject* pObject, IPhysicsEnvironment* pDestinationEnvironment)
 {
-    Log_Stub(LOG_VBox3D);
-    return false;
+    if (!pObject || !pDestinationEnvironment)
+        return false;
+    return pDestinationEnvironment == this && m_Objects.Find(static_cast<Box3DPhysicsObject*>(pObject)) != m_Objects.InvalidIndex();
 }
 
 void Box3DPhysicsEnvironment::CleanupDeleteList()
 {
+    CleanupDeadJoints();
     for (int i = 0; i < m_DeadObjects.Count(); i++)
         DeleteObject(m_DeadObjects[i]);
     m_DeadObjects.RemoveAll();
@@ -979,6 +1214,7 @@ static IPhysicsObject* RestoreObjectFromState(
     op.volume = state.volume;
     op.pGameData = pGameData;
     op.pName = pName;
+    op.enableCollisions = state.bCollisionEnabled;
     Vector com = state.massCenter;
     op.massCenterOverride = &com;
 
@@ -1119,7 +1355,8 @@ bool Box3DPhysicsEnvironment::Restore(const physrestoreparams_t& params)
     }
 
     IRestore* pRestore = params.pRestore;
-    if (pRestore->ReadInt() != kBox3DSaveVersion)
+    const int version = pRestore->ReadInt();
+    if (!IsSupportedBox3DSaveVersion(version))
         return false; // unknown format: let the game recreate from the entity's own saved state
 
     const auto lookup = [this](uintptr_t old) -> void* {
@@ -1135,7 +1372,7 @@ bool Box3DPhysicsEnvironment::Restore(const physrestoreparams_t& params)
         {
             const uintptr_t oldPtr = SaveReadPtr(pRestore);
             Box3DSavedObjectState state;
-            pRestore->ReadData(reinterpret_cast<char*>(&state), sizeof(state), sizeof(state));
+            ReadSaveStateForVersion(state, pRestore, version);
             IPhysicsObject* pObj = RestoreObjectFromState(this, state, params.pCollisionModel, params.pGameData, params.pName);
             if (!pObj)
                 return false;
@@ -1275,20 +1512,141 @@ void Box3DPhysicsEnvironment::PostRestore()
 
 bool Box3DPhysicsEnvironment::IsCollisionModelUsed(CPhysCollide* pCollide) const
 {
-    Log_Stub(LOG_VBox3D);
+    if (!pCollide)
+        return false;
+
+    for (int i = 0; i < m_Objects.Count(); i++)
+        if (m_Objects[i]->GetCollide() == pCollide)
+            return true;
+
+    for (int i = 0; i < m_DeadObjects.Count(); i++)
+        if (m_DeadObjects[i]->GetCollide() == pCollide)
+            return true;
+
+    return false;
+}
+
+bool Box3DPhysicsEnvironment::HasConstraintForObject(const Box3DPhysicsObject* pObject, bool bExternalOnly) const
+{
+    if (!pObject)
+        return false;
+
+    for (int i = 0; i < m_Constraints.Count(); i++)
+    {
+        const Box3DPhysicsConstraint* pConstraint = m_Constraints[i];
+        if (!pConstraint || pConstraint->IsBroken())
+            continue;
+
+        const bool bIsReference = pConstraint->GetReferenceObject() == pObject;
+        const bool bIsAttached = pConstraint->GetAttachedObject() == pObject;
+        if (!bIsReference && !bIsAttached)
+            continue;
+        if (!bExternalOnly)
+            return true;
+
+        IPhysicsObject* pOther = bIsReference ? pConstraint->GetAttachedObject() : pConstraint->GetReferenceObject();
+        if (pOther && pOther != pObject)
+            return true;
+    }
+
     return false;
 }
 
 void Box3DPhysicsEnvironment::TraceRay(const Ray_t& ray, unsigned int fMask, IPhysicsTraceFilter* pTraceFilter, trace_t* pTrace)
 {
-    Log_Stub(LOG_VBox3D);
+    if (!pTrace)
+        return;
+
+    ClearTrace(pTrace);
+    const Vector vecStart = ray.m_Start;
+    const Vector vecDelta = ray.m_Delta;
+
+    if (!vecStart.IsValid() || !vecDelta.IsValid() || vecDelta.LengthSqr() == 0.0f)
+        return;
+    pTrace->startpos = vecStart;
+    pTrace->endpos = vecStart + vecDelta;
+
+    WorldTraceRayContext context;
+    context.pFilter = pTraceFilter;
+    context.pTrace = pTrace;
+    context.vecStart = vecStart;
+    context.vecDelta = vecDelta;
+    context.fMask = fMask;
+
+    b3QueryFilter filter = b3DefaultQueryFilter();
+    b3World_CastRay(m_WorldId, ToBoxPosition(vecStart), SourceToBox::Distance(vecDelta), filter, WorldTraceRayCallback, &context);
 }
 
 void Box3DPhysicsEnvironment::SweepCollideable(
     const CPhysCollide* pCollide, const Vector& vecAbsStart, const Vector& vecAbsEnd, const QAngle& vecAngles,
     unsigned int fMask, IPhysicsTraceFilter* pTraceFilter, trace_t* pTrace)
 {
-    Log_Stub(LOG_VBox3D);
+    if (!pTrace)
+        return;
+
+    ClearTrace(pTrace);
+    const Vector vecDelta = vecAbsEnd - vecAbsStart;
+
+    if (!pCollide || !vecAbsStart.IsValid() || !vecAbsEnd.IsValid() || !vecAngles.IsValid() || vecDelta.LengthSqr() == 0.0f)
+        return;
+    pTrace->startpos = vecAbsStart;
+    pTrace->endpos = vecAbsEnd;
+
+    WorldTraceRayContext context;
+    context.pFilter = pTraceFilter;
+    context.pTrace = pTrace;
+    context.vecStart = vecAbsStart;
+    context.vecDelta = vecDelta;
+    context.fMask = fMask;
+
+    b3QueryFilter filter = b3DefaultQueryFilter();
+    const b3Pos origin = ToBoxPosition(vecAbsStart);
+    const b3Vec3 translation = SourceToBox::Distance(vecDelta);
+    const b3Quat rotation = SourceToBox::Angle(vecAngles);
+
+    for (int i = 0; i < pCollide->m_Convexes.Count(); i++)
+    {
+        const CPhysConvex* pConvex = pCollide->m_Convexes[i];
+        if (!pConvex || !pConvex->m_pHull)
+            continue;
+
+        const b3HullData* pHull = pConvex->m_pHull;
+        const b3Vec3* pHullPoints = b3GetHullPoints(pHull);
+        CUtlVector<b3Vec3> points;
+        points.SetCount(pHull->vertexCount);
+        for (int p = 0; p < pHull->vertexCount; p++)
+            points[p] = b3RotateVector(rotation, pHullPoints[p]);
+
+        b3ShapeProxy proxy = { points.Base(), points.Count(), 0.0f };
+        b3World_OverlapShape(m_WorldId, origin, &proxy, filter, WorldSweepOverlapCallback, &context);
+        b3World_CastShape(m_WorldId, origin, &proxy, translation, filter, WorldTraceRayCallback, &context);
+    }
+
+    if (pCollide->m_pMesh)
+    {
+        const b3AABB bounds = pCollide->m_pMesh->bounds;
+        b3Vec3 corners[8];
+        int n = 0;
+        for (int x = 0; x < 2; x++)
+        {
+            for (int y = 0; y < 2; y++)
+            {
+                for (int z = 0; z < 2; z++)
+                {
+                    const b3Vec3 p = {
+                        x ? bounds.upperBound.x : bounds.lowerBound.x,
+                        y ? bounds.upperBound.y : bounds.lowerBound.y,
+                        z ? bounds.upperBound.z : bounds.lowerBound.z,
+                    };
+                    corners[n++] = b3RotateVector(rotation, p);
+                }
+            }
+        }
+
+        b3ShapeProxy proxy = { corners, n, 0.0f };
+        b3World_OverlapShape(m_WorldId, origin, &proxy, filter, WorldSweepOverlapCallback, &context);
+        b3World_CastShape(m_WorldId, origin, &proxy, translation, filter, WorldTraceRayCallback, &context);
+    }
 }
 
 void Box3DPhysicsEnvironment::GetPerformanceSettings(physics_performanceparams_t* pOutput) const
@@ -1305,12 +1663,20 @@ void Box3DPhysicsEnvironment::SetPerformanceSettings(const physics_performancepa
 
 void Box3DPhysicsEnvironment::ReadStats(physics_stats_t* pOutput)
 {
-    Log_Stub(LOG_VBox3D);
+    if (!pOutput)
+        return;
+
+    *pOutput = m_Stats;
+    pOutput->impactSysNum = m_Objects.Count();
+    pOutput->potentialCollisionsObjectVsObject = Max(m_Objects.Count() * (m_Objects.Count() - 1) / 2, 0);
+    pOutput->potentialCollisionsObjectVsWorld = m_Objects.Count();
+    pOutput->collisionPairsTotal = m_Constraints.Count();
+    pOutput->frictionEventsProcessed = m_Springs.Count();
 }
 
 void Box3DPhysicsEnvironment::ClearStats()
 {
-    Log_Stub(LOG_VBox3D);
+    V_memset(&m_Stats, 0, sizeof(m_Stats));
 }
 
 // Raw-buffer serialization (clientside prediction). Same object state, but same-process so the collision
@@ -1347,21 +1713,24 @@ void Box3DPhysicsEnvironment::SerializeObjectToBuffer(IPhysicsObject* pObject, u
 IPhysicsObject* Box3DPhysicsEnvironment::UnserializeObjectFromBuffer(
     void* pGameData, unsigned char* pBuffer, unsigned int bufferSize, bool enableCollisions)
 {
-    if (!pBuffer || bufferSize < kBufferHeader + sizeof(Box3DSavedObjectState))
+    if (!pBuffer || bufferSize < kBufferHeader)
         return nullptr;
 
     const unsigned char* p = pBuffer;
     int version;
     memcpy(&version, p, sizeof(version));
     p += sizeof(version);
-    if (version != kBox3DSaveVersion)
+    if (!IsSupportedBox3DSaveVersion(version))
+        return nullptr;
+    const size_t stateSize = SaveStateSizeForVersion(version);
+    if (bufferSize < kBufferHeader + stateSize)
         return nullptr;
 
     const CPhysCollide* pCollide;
     memcpy(&pCollide, p, sizeof(pCollide));
     p += sizeof(pCollide);
     Box3DSavedObjectState state;
-    memcpy(&state, p, sizeof(state));
+    CopySaveStateForVersion(state, p, version);
 
     IPhysicsObject* pObj = RestoreObjectFromState(this, state, pCollide, pGameData, nullptr);
     if (pObj)
@@ -1381,18 +1750,21 @@ void Box3DPhysicsEnvironment::DebugCheckContacts()
 
 void Box3DPhysicsEnvironment::SetAlternateGravity(const Vector& gravityVector)
 {
-    Log_Stub(LOG_VBox3D);
+    if (gravityVector.IsValid())
+        m_vecAlternateGravity = gravityVector;
 }
 
 void Box3DPhysicsEnvironment::GetAlternateGravity(Vector* pGravityVector) const
 {
-    Log_Stub(LOG_VBox3D);
+    if (pGravityVector)
+        *pGravityVector = m_vecAlternateGravity;
 }
 
 float Box3DPhysicsEnvironment::GetDeltaFrameTime(int maxTicks) const
 {
-    Log_Stub(LOG_VBox3D);
-    return 0.0f;
+    if (maxTicks <= 0)
+        return 0.0f;
+    return m_flLastStepTime * maxTicks;
 }
 
 void Box3DPhysicsEnvironment::ForceObjectsToSleep(IPhysicsObject** pList, int listCount)

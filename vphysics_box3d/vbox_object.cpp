@@ -40,6 +40,49 @@ namespace
             fn(shapes[i]);
     }
 
+    void ApplyWorldMaterialToBoxMaterial(b3SurfaceMaterial& material, int materialIndex)
+    {
+        Box3DPhysicsSurfaceProps& props = Box3DPhysicsSurfaceProps::GetInstance();
+        material.userMaterialId = props.GetWorldSurfaceIndex(materialIndex);
+        surfacedata_t* pSurface = props.GetWorldSurfaceData(materialIndex);
+        if (!pSurface)
+            return;
+
+        material.friction = IsFinite(pSurface->physics.friction) ? Max(pSurface->physics.friction, 0.0f) : 0.0f;
+        material.restitution = IsFinite(pSurface->physics.elasticity) ? pSurface->physics.elasticity : 0.0f;
+    }
+
+    void ApplyWorldMeshMaterials(b3ShapeDef& shapeDef, const b3MeshData* pMesh, CUtlVector<b3SurfaceMaterial>& materials)
+    {
+        if (!pMesh)
+            return;
+
+        if (pMesh->materialCount <= 1)
+        {
+            ApplyWorldMaterialToBoxMaterial(shapeDef.baseMaterial, 0);
+            return;
+        }
+
+        materials.SetCount(pMesh->materialCount);
+        for (int i = 0; i < pMesh->materialCount; i++)
+        {
+            materials[i] = b3DefaultSurfaceMaterial();
+            ApplyWorldMaterialToBoxMaterial(materials[i], i);
+        }
+        shapeDef.materials = materials.Base();
+        shapeDef.materialCount = materials.Count();
+    }
+
+    bool MatrixIsValid(const matrix3x4_t& matrix)
+    {
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 4; col++)
+                if (!IsFinite(matrix[row][col]))
+                    return false;
+
+        return true;
+    }
+
     // Integral of a differential drag area's torque over an OBB half-extent (IVP RecomputeDragBases).
     float AngDragIntegral(float flInvInertia, float l, float w, float h)
     {
@@ -67,17 +110,10 @@ Box3DPhysicsObject::Box3DPhysicsObject(
         if (pParams->pName)
             m_pName = pParams->pName;
 
-        m_flLinearDamping = pParams->damping;
-        m_flAngularDamping = pParams->rotdamping;
+        SetDamping(&pParams->damping, &pParams->rotdamping);
         m_flVolume = pParams->volume;
-        m_flDragCoefficient = pParams->dragCoefficient;
-        m_flAngularDragCoefficient = pParams->dragCoefficient;
-        m_bDragEnabled = pParams->dragCoefficient != 0.0f;
-        if (!bStatic)
-        {
-            b3Body_SetLinearDamping(bodyId, pParams->damping);
-            b3Body_SetAngularDamping(bodyId, pParams->rotdamping);
-        }
+        float flDragCoefficient = pParams->dragCoefficient;
+        SetDragCoefficient(&flDragCoefficient, &flDragCoefficient);
 
         if (pParams->mass > 0.0f)
             SetMass(pParams->mass);
@@ -88,9 +124,20 @@ Box3DPhysicsObject::Box3DPhysicsObject(
         m_flCachedMass = bStatic ? 0.0f : b3Body_GetMass(bodyId);
         m_flCachedInvMass = bStatic ? 0.0f : b3Body_GetInverseMass(bodyId);
     }
+    if (!bStatic)
+    {
+        m_vecCachedInertia = GetInertia();
+        m_vecRequestedInertia = m_vecCachedInertia;
+    }
 
     if (surfacedata_t* pSurface = Box3DPhysicsSurfaceProps::GetInstance().GetSurfaceData(m_materialIndex))
+    {
         m_flMaterialDensity = pSurface->physics.density;
+        if (!IsFinite(m_flMaterialDensity) || m_flMaterialDensity < 0.0f)
+            m_flMaterialDensity = 0.0f;
+    }
+    if (!bStatic && pParams && IsFinite(pParams->inertia) && pParams->inertia > 0.0f)
+        SetInertia(Vector(pParams->inertia, pParams->inertia, pParams->inertia));
     CalculateBuoyancy();
     RecomputeDragBases();
 }
@@ -136,7 +183,7 @@ bool Box3DPhysicsObject::IsFluid() const
 }
 bool Box3DPhysicsObject::IsHinged() const
 {
-    return false;
+    return m_bHinged;
 }
 bool Box3DPhysicsObject::IsCollisionEnabled() const
 {
@@ -158,9 +205,9 @@ bool Box3DPhysicsObject::IsMoveable() const
 {
     return IsMotionEnabled();
 }
-bool Box3DPhysicsObject::IsAttachedToConstraint(bool) const
+bool Box3DPhysicsObject::IsAttachedToConstraint(bool bExternalOnly) const
 {
-    return false;
+    return m_pEnvironment && m_pEnvironment->HasConstraintForObject(this, bExternalOnly);
 }
 
 void Box3DPhysicsObject::EnableCollisions(bool enable)
@@ -201,7 +248,12 @@ void Box3DPhysicsObject::EnableMotion(bool enable)
     b3Body_SetType(m_BodyId, enable ? b3_dynamicBody : b3_staticBody);
     if (enable)
     {
+        const Vector vecRequestedInertia = m_vecRequestedInertia.IsValid() && m_vecRequestedInertia != vec3_origin ? m_vecRequestedInertia : m_vecCachedInertia;
         b3Body_ApplyMassFromShapes(m_BodyId);
+        if (m_flCachedMass > 0.0f)
+            SetMass(m_flCachedMass);
+        if (vecRequestedInertia.IsValid() && vecRequestedInertia != vec3_origin)
+            SetInertia(vecRequestedInertia);
         b3Body_SetAwake(m_BodyId, true);
     }
 }
@@ -257,6 +309,16 @@ void Box3DPhysicsObject::RecheckCollisionFilter()
     // naming it as a partner; the clear drops the ones it owns. Outside the step, so no lock needed.
     ++m_nRulesEpoch;
     m_CollisionCache.clear();
+    if (!b3Body_IsValid(m_BodyId))
+        return;
+
+    ForEachShape(m_BodyId, [](b3ShapeId shape) {
+        b3Filter filter = b3Shape_GetFilter(shape);
+        b3Filter temporaryFilter = filter;
+        temporaryFilter.groupIndex = filter.groupIndex == 0 ? 1 : 0;
+        b3Shape_SetFilter(shape, temporaryFilter, true);
+        b3Shape_SetFilter(shape, filter, true);
+    });
 }
 void Box3DPhysicsObject::RecheckContactPoints(bool)
 { /* Not needed */
@@ -266,6 +328,9 @@ void Box3DPhysicsObject::RecheckContactPoints(bool)
 
 void Box3DPhysicsObject::SetMass(float mass)
 {
+    if (!IsFinite(mass))
+        return;
+
     mass = clamp(mass, 1.0f, VPHYSICS_MAX_MASS);
     m_flCachedMass = mass;
     m_flCachedInvMass = 1.0f / mass;
@@ -287,6 +352,7 @@ void Box3DPhysicsObject::SetMass(float mass)
     massData.inertia.cz.y *= scale;
     massData.inertia.cz.z *= scale;
     b3Body_SetMassData(m_BodyId, massData);
+    m_vecCachedInertia = GetInertia();
     RecomputeDragBases();
 }
 
@@ -317,20 +383,36 @@ Vector Box3DPhysicsObject::GetInvInertia() const
 
 void Box3DPhysicsObject::SetInertia(const Vector& inertia)
 {
-    if (m_bStatic)
+    if (m_bStatic || !inertia.IsValid() || inertia.x <= 0.0f || inertia.y <= 0.0f || inertia.z <= 0.0f)
         return;
+
+    const Vector vecRequestedInertia(fabsf(inertia.x), fabsf(inertia.y), fabsf(inertia.z));
+    m_vecRequestedInertia = vecRequestedInertia;
 
     // Clamp to vbox_inertia_scale x Box3D's native inertia; IVP's raw value flails active ragdolls.
     const float flScale = vbox_inertia_scale.GetFloat();
+    if (!IsFinite(flScale) || flScale <= 0.0f)
+    {
+        RecomputeDragBases();
+        return;
+    }
     b3MassData massData = b3Body_GetMassData(m_BodyId);
     const float capX = fabsf(massData.inertia.cx.x) * flScale;
     const float capY = fabsf(massData.inertia.cy.y) * flScale;
     const float capZ = fabsf(massData.inertia.cz.z) * flScale;
+    if (capX <= 0.0f || capY <= 0.0f || capZ <= 0.0f)
+    {
+        RecomputeDragBases();
+        return;
+    }
+
+    const Vector applied(Min(vecRequestedInertia.x, capX), Min(vecRequestedInertia.y, capY), Min(vecRequestedInertia.z, capZ));
     massData.inertia = b3Matrix3{};
-    massData.inertia.cx.x = Min(fabsf(inertia.x), capX);
-    massData.inertia.cy.y = Min(fabsf(inertia.y), capY);
-    massData.inertia.cz.z = Min(fabsf(inertia.z), capZ);
+    massData.inertia.cx.x = applied.x;
+    massData.inertia.cy.y = applied.y;
+    massData.inertia.cz.z = applied.z;
     b3Body_SetMassData(m_BodyId, massData);
+    m_vecCachedInertia = applied;
     RecomputeDragBases();
 }
 
@@ -338,15 +420,21 @@ void Box3DPhysicsObject::SetDamping(const float* speed, const float* rot)
 {
     if (speed)
     {
-        m_flLinearDamping = *speed;
-        if (!m_bStatic)
-            b3Body_SetLinearDamping(m_BodyId, *speed);
+        if (IsFinite(*speed))
+        {
+            m_flLinearDamping = Max(*speed, 0.0f);
+            if (!m_bStatic)
+                b3Body_SetLinearDamping(m_BodyId, m_flLinearDamping);
+        }
     }
     if (rot)
     {
-        m_flAngularDamping = *rot;
-        if (!m_bStatic)
-            b3Body_SetAngularDamping(m_BodyId, *rot);
+        if (IsFinite(*rot))
+        {
+            m_flAngularDamping = Max(*rot, 0.0f);
+            if (!m_bStatic)
+                b3Body_SetAngularDamping(m_BodyId, m_flAngularDamping);
+        }
     }
 }
 
@@ -360,9 +448,9 @@ void Box3DPhysicsObject::GetDamping(float* speed, float* rot) const
 
 void Box3DPhysicsObject::SetDragCoefficient(float* pDrag, float* pAngularDrag)
 {
-    if (pDrag)
+    if (pDrag && IsFinite(*pDrag))
         m_flDragCoefficient = *pDrag;
-    if (pAngularDrag)
+    if (pAngularDrag && IsFinite(*pAngularDrag))
         m_flAngularDragCoefficient = *pAngularDrag;
     m_bDragEnabled = m_flDragCoefficient != 0.0f || m_flAngularDragCoefficient != 0.0f;
     RecomputeDragBases();
@@ -431,7 +519,10 @@ void Box3DPhysicsObject::FillSaveState(Box3DSavedObjectState& s) const
     GetPosition(&s.position, &s.angles);
     GetVelocity(&s.velocity, &s.angularVelocity);
     s.massCenter = GetMassCenterLocalSpace();
-    s.inertia = GetInertia();
+    Vector vecInertia = GetInertia();
+    if (!m_bStatic && m_vecRequestedInertia.IsValid() && m_vecRequestedInertia != vec3_origin && (!m_bMotionEnabled || vecInertia == vec3_origin))
+        vecInertia = m_vecRequestedInertia;
+    s.inertia = vecInertia;
     s.mass = GetMass();
     s.sphereRadius = m_flSphereRadius;
     s.linearDamping = m_flLinearDamping;
@@ -453,6 +544,7 @@ void Box3DPhysicsObject::FillSaveState(Box3DSavedObjectState& s) const
     s.bDragEnabled = m_bDragEnabled;
     s.bAsleep = IsAsleep();
     s.bTrigger = m_bTrigger;
+    s.bHinged = m_bHinged;
 }
 
 // CreateObject already set transform, mass, damping, material and COM; apply the rest.
@@ -481,6 +573,8 @@ void Box3DPhysicsObject::ApplyRestoreState(const Box3DSavedObjectState& s)
         EnableCollisions(false);
     if (s.bTrigger)
         BecomeTrigger();
+    if (s.bHinged)
+        BecomeHinged(0);
     if (!s.bMotionEnabled)
         EnableMotion(false); // freezes to static; do this last so the velocity above still applied
 
@@ -504,17 +598,26 @@ void Box3DPhysicsObject::SetMaterialIndex(int materialIndex)
     surfacedata_t* pSurface = Box3DPhysicsSurfaceProps::GetInstance().GetSurfaceData(materialIndex);
     if (pSurface)
     {
-        m_flMaterialDensity = pSurface->physics.density;
+        m_flMaterialDensity = IsFinite(pSurface->physics.density) && pSurface->physics.density > 0.0f ? pSurface->physics.density : 0.0f;
         CalculateBuoyancy();
     }
-    if (!pSurface || !b3Body_IsValid(m_BodyId))
+    const float flFriction = pSurface && IsFinite(pSurface->physics.friction) ? Max(pSurface->physics.friction, 0.0f) : 0.0f;
+    const float flRestitution = pSurface && IsFinite(pSurface->physics.elasticity) ? pSurface->physics.elasticity : 0.0f;
+    if (!b3Body_IsValid(m_BodyId))
         return;
-
-    const float flFriction = Max(pSurface->physics.friction, 0.0f);
-    const float flRestitution = pSurface->physics.elasticity;
     ForEachShape(m_BodyId, [&](b3ShapeId shape) {
-        b3Shape_SetFriction(shape, flFriction);
-        b3Shape_SetRestitution(shape, flRestitution);
+        auto applyMaterial = [&](b3SurfaceMaterial material) {
+        material.friction = flFriction;
+        material.restitution = flRestitution;
+        material.userMaterialId = m_materialIndex;
+            return material;
+        };
+
+        b3SurfaceMaterial material = applyMaterial(b3Shape_GetSurfaceMaterial(shape));
+        b3Shape_SetSurfaceMaterial(shape, material);
+        const int nMaterialCount = b3Shape_GetMeshMaterialCount(shape);
+        for (int i = 0; i < nMaterialCount; i++)
+            b3Shape_SetMeshMaterial(shape, applyMaterial(b3Shape_GetMeshSurfaceMaterial(shape, i)), i);
     });
 
     if (m_pShadowController)
@@ -535,7 +638,18 @@ float Box3DPhysicsObject::GetSphereRadius() const
 }
 void Box3DPhysicsObject::SetSphereRadius(float radius)
 {
+    if (!IsFinite(radius) || radius < 0.0f)
+        return;
+    if (m_flSphereRadius == radius)
+        return;
+
     m_flSphereRadius = radius;
+    if (!m_pCollide && b3Body_IsValid(m_BodyId))
+    {
+        RebuildShapes(m_bTrigger);
+        if (!m_bStatic)
+            SetMass(m_flCachedMass);
+    }
 }
 float Box3DPhysicsObject::GetEnergy() const
 {
@@ -563,11 +677,17 @@ Vector Box3DPhysicsObject::GetMassCenterLocalSpace() const
 
 void Box3DPhysicsObject::SetPosition(const Vector& worldPosition, const QAngle& angles, bool)
 {
+    if (!worldPosition.IsValid() || !angles.IsValid())
+        return;
+
     b3Body_SetTransform(m_BodyId, SourceToBox::Distance(worldPosition), SourceToBox::Angle(angles));
 }
 
 void Box3DPhysicsObject::SetPositionMatrix(const matrix3x4_t& matrix, bool)
 {
+    if (!MatrixIsValid(matrix))
+        return;
+
     const b3Transform xf = SourceToBox::Transform(matrix);
     b3Body_SetTransform(m_BodyId, xf.p, xf.q);
 }
@@ -650,14 +770,14 @@ void Box3DPhysicsObject::SnapshotPreStepVelocity()
 Vector Box3DPhysicsObject::FakeVelocity(const Vector& vecVelocity)
 {
     const Vector vecOld = BoxToSource::Distance(b3Body_GetLinearVelocity(m_BodyId));
-    if (!m_bStatic)
+    if (!m_bStatic && vecVelocity.IsValid())
         b3Body_SetLinearVelocity(m_BodyId, SourceToBox::Distance(vecVelocity));
     return vecOld;
 }
 
 void Box3DPhysicsObject::RestoreVelocity(const Vector& vecVelocity)
 {
-    if (!m_bStatic)
+    if (!m_bStatic && vecVelocity.IsValid())
         b3Body_SetLinearVelocity(m_BodyId, SourceToBox::Distance(vecVelocity));
 }
 
@@ -665,16 +785,19 @@ void Box3DPhysicsObject::AddVelocity(const Vector* velocity, const AngularImpuls
 {
     if (m_bStatic)
         return;
-    if (velocity)
+
+    const bool bVel = velocity && velocity->IsValid();
+    const bool bAng = angularVelocity && angularVelocity->IsValid();
+    if (bVel)
         b3Body_SetLinearVelocity(m_BodyId, b3Add(b3Body_GetLinearVelocity(m_BodyId), SourceToBox::Distance(*velocity)));
-    if (angularVelocity)
+    if (bAng)
     {
         Vector vecWorldAngular;
         LocalToWorldVector(&vecWorldAngular, *angularVelocity);
         b3Body_SetAngularVelocity(
             m_BodyId, b3Add(b3Body_GetAngularVelocity(m_BodyId), SourceToBox::AngularImpulse(vecWorldAngular)));
     }
-    if (velocity || angularVelocity)
+    if (bVel || bAng)
         b3Body_SetAwake(m_BodyId, true);
 }
 
@@ -717,19 +840,19 @@ void Box3DPhysicsObject::WorldToLocalVector(Vector* localVector, const Vector& w
 
 void Box3DPhysicsObject::ApplyForceCenter(const Vector& forceVector)
 {
-    if (!m_bStatic)
+    if (!m_bStatic && forceVector.IsValid())
         b3Body_ApplyLinearImpulseToCenter(m_BodyId, SourceToBox::Distance(forceVector), true);
 }
 
 void Box3DPhysicsObject::ApplyForceOffset(const Vector& forceVector, const Vector& worldPosition)
 {
-    if (!m_bStatic)
+    if (!m_bStatic && forceVector.IsValid() && worldPosition.IsValid())
         b3Body_ApplyLinearImpulse(m_BodyId, SourceToBox::Distance(forceVector), SourceToBox::Distance(worldPosition), true);
 }
 
 void Box3DPhysicsObject::ApplyTorqueCenter(const AngularImpulse& torque)
 {
-    if (m_bStatic)
+    if (m_bStatic || !torque.IsValid())
         return;
 
     // IVP applies this torque impulse in world space (async_rot_push_core_multiple_ws).
@@ -774,8 +897,41 @@ float Box3DPhysicsObject::CalculateAngularDrag(const Vector&) const
     return 0.0f;
 }
 
-bool Box3DPhysicsObject::GetContactPoint(Vector*, IPhysicsObject**) const
+bool Box3DPhysicsObject::GetContactPoint(Vector* pContactPoint, IPhysicsObject** ppContactObject) const
 {
+    if (ppContactObject)
+        *ppContactObject = nullptr;
+
+    b3ContactData contacts[16];
+    const int nCount = b3Body_GetContactData(m_BodyId, contacts, 16);
+    for (int i = 0; i < nCount; i++)
+    {
+        Box3DPhysicsObject* pA = static_cast<Box3DPhysicsObject*>(b3Body_GetUserData(b3Shape_GetBody(contacts[i].shapeIdA)));
+        const bool bSelfIsA = pA == this;
+        Box3DPhysicsObject* pOther = bSelfIsA
+            ? static_cast<Box3DPhysicsObject*>(b3Body_GetUserData(b3Shape_GetBody(contacts[i].shapeIdB)))
+            : pA;
+        if (!pOther)
+            continue;
+
+        for (int j = 0; j < contacts[i].manifoldCount; j++)
+        {
+            const b3Manifold& manifold = contacts[i].manifolds[j];
+            if (manifold.pointCount <= 0)
+                continue;
+
+            if (pContactPoint)
+            {
+                const b3Pos center = b3Body_GetWorldCenter(m_BodyId);
+                const b3Vec3 anchor = bSelfIsA ? manifold.points[0].anchorA : manifold.points[0].anchorB;
+                *pContactPoint = BoxToSource::Distance(b3OffsetPos(center, anchor));
+            }
+            if (ppContactObject)
+                *ppContactObject = pOther;
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -945,14 +1101,19 @@ const char* Box3DPhysicsObject::GetName() const
 // Swap this body's shapes between sensor (trigger: non-solid, overlap-reporting) and normal solid shapes.
 void Box3DPhysicsObject::RebuildShapes(bool asSensor)
 {
-    b3ShapeId shapes[32];
-    const int nOld = b3Body_GetShapes(m_BodyId, shapes, ARRAYSIZE(shapes));
+    const int nOld = b3Body_GetShapeCount(m_BodyId);
+    CUtlVector<b3ShapeId> shapes;
+    shapes.SetCount(nOld);
+    b3Body_GetShapes(m_BodyId, shapes.Base(), nOld);
     for (int i = 0; i < nOld; i++)
         b3DestroyShape(shapes[i], false);
 
     b3ShapeDef shapeDef = b3DefaultShapeDef();
+    shapeDef.baseMaterial.userMaterialId = m_materialIndex;
     shapeDef.enableSensorEvents = true;
     shapeDef.updateBodyMass = false; // keep the body's mass across the swap; RemoveTrigger restores it
+    if (!m_bCollisionEnabled)
+        shapeDef.filter.maskBits = 0;
     if (asSensor)
     {
         shapeDef.isSensor = true;
@@ -965,9 +1126,9 @@ void Box3DPhysicsObject::RebuildShapes(bool asSensor)
         shapeDef.enablePreSolveEvents = true;
         if (surfacedata_t* pSurface = Box3DPhysicsSurfaceProps::GetInstance().GetSurfaceData(m_materialIndex))
         {
-            shapeDef.baseMaterial.friction = Max(pSurface->physics.friction, 0.0f);
-            shapeDef.baseMaterial.restitution = pSurface->physics.elasticity;
-            if (pSurface->physics.density > 0.0f)
+            shapeDef.baseMaterial.friction = IsFinite(pSurface->physics.friction) ? Max(pSurface->physics.friction, 0.0f) : 0.0f;
+            shapeDef.baseMaterial.restitution = IsFinite(pSurface->physics.elasticity) ? pSurface->physics.elasticity : 0.0f;
+            if (IsFinite(pSurface->physics.density) && pSurface->physics.density > 0.0f)
                 shapeDef.density = pSurface->physics.density;
         }
     }
@@ -982,7 +1143,13 @@ void Box3DPhysicsObject::RebuildShapes(bool asSensor)
             b3CreateHullShape(m_BodyId, &shapeDef, m_bStatic ? pConvex->m_pHull : pConvex->GetSimHull());
         }
         if (m_pCollide->m_pMesh)
-            b3CreateMeshShape(m_BodyId, &shapeDef, m_pCollide->m_pMesh, b3Vec3{ 1.0f, 1.0f, 1.0f });
+        {
+            b3ShapeDef meshShapeDef = shapeDef;
+            CUtlVector<b3SurfaceMaterial> meshMaterials;
+            if (m_bStatic)
+                ApplyWorldMeshMaterials(meshShapeDef, m_pCollide->m_pMesh, meshMaterials);
+            b3CreateMeshShape(m_BodyId, &meshShapeDef, m_pCollide->m_pMesh, b3Vec3{ 1.0f, 1.0f, 1.0f });
+        }
     }
     else if (m_flSphereRadius > 0.0f)
     {
@@ -1010,11 +1177,11 @@ void Box3DPhysicsObject::RemoveTrigger()
 }
 void Box3DPhysicsObject::BecomeHinged(int)
 {
-    Log_Stub(LOG_VBox3D);
+    m_bHinged = true;
 }
 void Box3DPhysicsObject::RemoveHinged()
 {
-    Log_Stub(LOG_VBox3D);
+    m_bHinged = false;
 }
 
 IPhysicsFrictionSnapshot* Box3DPhysicsObject::CreateFrictionSnapshot()
