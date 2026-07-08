@@ -80,7 +80,7 @@ void Box3DPhysicsConstraint::Init(const std::function<b3JointId()>& buildFn, boo
 void Box3DPhysicsConstraint::DestroyJoint()
 {
     if (b3Joint_IsValid(m_JointId))
-        b3DestroyJoint(m_JointId, true);
+        m_pEnvironment->DestroyJointSafely(m_JointId);
     m_JointId = b3_nullJointId;
 }
 
@@ -512,7 +512,8 @@ bool Box3DPhysicsConstraint::GetConstraintParams(constraint_breakableparams_t* p
 void Box3DPhysicsConstraintGroup::Activate()
 {
     for (int i = 0; i < m_Constraints.Count(); i++)
-        m_Constraints[i]->Activate();
+        if (m_Constraints[i]->ShouldActivateFromGroup())
+            m_Constraints[i]->Activate();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -524,6 +525,7 @@ IPhysicsConstraint* Box3DPhysicsEnvironment::FinishConstraint(
     const std::function<b3JointId()>& buildFn)
 {
     pConstraint->SetBreakParams(breakParams);
+    pConstraint->SetInitiallyActive(breakParams.isActive);
     m_Constraints.AddToTail(pConstraint);
     if (Box3DPhysicsConstraintGroup* pGrp = static_cast<Box3DPhysicsConstraintGroup*>(pGroup))
     {
@@ -955,7 +957,10 @@ IPhysicsConstraintGroup* Box3DPhysicsEnvironment::CreateConstraintGroup(const co
 
 void Box3DPhysicsEnvironment::DestroyConstraintGroup(IPhysicsConstraintGroup* pGroup)
 {
-    delete static_cast<Box3DPhysicsConstraintGroup*>(pGroup);
+    Box3DPhysicsConstraintGroup* pBoxGroup = static_cast<Box3DPhysicsConstraintGroup*>(pGroup);
+    if (pBoxGroup)
+        pBoxGroup->DetachConstraints();
+    delete pBoxGroup;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1033,13 +1038,27 @@ void Box3DPhysicsSpring::GetEndpoints(Vector* worldPositionStart, Vector* worldP
 {
     if (worldPositionStart)
     {
-        const b3WorldTransform wt = b3Body_GetTransform(m_pStart->GetBodyID());
-        *worldPositionStart = BoxToSource::Distance(b3Add(b3ToVec3(wt.p), b3RotateVector(wt.q, m_AnchorStart)));
+        if (m_pStart)
+        {
+            const b3WorldTransform wt = b3Body_GetTransform(m_pStart->GetBodyID());
+            *worldPositionStart = BoxToSource::Distance(b3Add(b3ToVec3(wt.p), b3RotateVector(wt.q, m_AnchorStart)));
+        }
+        else
+        {
+            *worldPositionStart = vec3_origin;
+        }
     }
     if (worldPositionEnd)
     {
-        const b3WorldTransform wt = b3Body_GetTransform(m_pEnd->GetBodyID());
-        *worldPositionEnd = BoxToSource::Distance(b3Add(b3ToVec3(wt.p), b3RotateVector(wt.q, m_AnchorEnd)));
+        if (m_pEnd)
+        {
+            const b3WorldTransform wt = b3Body_GetTransform(m_pEnd->GetBodyID());
+            *worldPositionEnd = BoxToSource::Distance(b3Add(b3ToVec3(wt.p), b3RotateVector(wt.q, m_AnchorEnd)));
+        }
+        else
+        {
+            *worldPositionEnd = vec3_origin;
+        }
     }
 }
 

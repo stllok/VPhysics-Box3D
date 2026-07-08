@@ -80,6 +80,14 @@ public:
 
     // Store the joint builder and create it now if bActive (grouped constraints defer to the group's Activate).
     void Init(const std::function<b3JointId()>& buildFn, bool bActive);
+    void SetInitiallyActive(bool bActive)
+    {
+        m_bInitiallyActive = bActive;
+    }
+    bool ShouldActivateFromGroup() const
+    {
+        return m_bInitiallyActive && !m_bBroken;
+    }
     void SetGroup(Box3DPhysicsConstraintGroup* pGroup)
     {
         m_pGroup = pGroup;
@@ -159,6 +167,7 @@ private:
     b3JointId m_JointId = b3_nullJointId;
     std::function<b3JointId()> m_BuildFn;
     constraint_breakableparams_t m_BreakParams = {};
+    bool m_bInitiallyActive = true;
     bool m_bBroken = false;
 
     bool m_bPulley = false;
@@ -266,6 +275,12 @@ public:
     void RemoveConstraint(Box3DPhysicsConstraint* pConstraint)
     {
         m_Constraints.FindAndRemove(pConstraint);
+    }
+    void DetachConstraints()
+    {
+        for (int i = 0; i < m_Constraints.Count(); i++)
+            m_Constraints[i]->SetGroup(nullptr);
+        m_Constraints.RemoveAll();
     }
 
 private:
