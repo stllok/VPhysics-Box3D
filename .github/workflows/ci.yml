@@ -10,6 +10,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  qa:
+    name: qa checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run motion parity guard
+        run: python3 qa/test_motion_parity.py
+
   windows:
     name: windows ${{ matrix.preset }} ${{ matrix.config }}
     runs-on: windows-2022

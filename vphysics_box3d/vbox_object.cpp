@@ -876,6 +876,15 @@ void Box3DPhysicsObject::CalculateForceOffset(
 void Box3DPhysicsObject::CalculateVelocityOffset(
     const Vector& forceVector, const Vector& worldPosition, Vector* centerVelocity, AngularImpulse* centerAngularVelocity) const
 {
+    if (!IsMoveable())
+    {
+        if (centerVelocity)
+            *centerVelocity = vec3_origin;
+        if (centerAngularVelocity)
+            *centerAngularVelocity = vec3_origin;
+        return;
+    }
+
     if (centerVelocity)
         *centerVelocity = forceVector * GetInvMass();
     if (centerAngularVelocity)

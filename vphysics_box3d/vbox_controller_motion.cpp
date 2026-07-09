@@ -77,21 +77,25 @@ void Box3DPhysicsMotionController::OnPreSimulate(float flDeltaTime)
             continue;
 
         Vector vecLinear = vec3_origin;
-        AngularImpulse angLocalAngular = vec3_origin;
-        const IMotionEvent::simresult_e result = m_pHandler->Simulate(this, pObject, flDeltaTime, vecLinear, angLocalAngular);
+        AngularImpulse angAngular = vec3_origin;
+        const IMotionEvent::simresult_e result = m_pHandler->Simulate(this, pObject, flDeltaTime, vecLinear, angAngular);
 
         vecLinear *= flDeltaTime;
-        angLocalAngular *= flDeltaTime;
+        angAngular *= flDeltaTime;
 
-        // The linear value is local or global depending on the result type; the angular value is
-        // always in the object's local space. AddVelocity takes it as-is; ApplyTorqueCenter takes
-        // a world-space torque impulse, so rotate it out for the force path.
+        // The result type controls the coordinate space for both linear and angular values.
+        // AddVelocity takes angular velocity in local space; ApplyTorqueCenter takes world-space torque.
+        const bool bLocalResult = result == IMotionEvent::SIM_LOCAL_ACCELERATION || result == IMotionEvent::SIM_LOCAL_FORCE;
         Vector vecWorldLinear = vecLinear;
-        if (result == IMotionEvent::SIM_LOCAL_ACCELERATION || result == IMotionEvent::SIM_LOCAL_FORCE)
+        if (bLocalResult)
             pObject->LocalToWorldVector(&vecWorldLinear, vecLinear);
 
-        Vector vecWorldAngular;
-        pObject->LocalToWorldVector(&vecWorldAngular, angLocalAngular);
+        AngularImpulse angLocalAngular = angAngular;
+        AngularImpulse angWorldAngular = angAngular;
+        if (bLocalResult)
+            pObject->LocalToWorldVector(&angWorldAngular, angAngular);
+        else
+            pObject->WorldToLocalVector(&angLocalAngular, angAngular);
 
         switch (result)
         {
@@ -103,7 +107,7 @@ void Box3DPhysicsMotionController::OnPreSimulate(float flDeltaTime)
             case IMotionEvent::SIM_GLOBAL_FORCE:
             case IMotionEvent::SIM_LOCAL_FORCE:
                 pObject->ApplyForceCenter(vecWorldLinear);
-                pObject->ApplyTorqueCenter(vecWorldAngular);
+                pObject->ApplyTorqueCenter(angWorldAngular);
                 break;
 
             case IMotionEvent::SIM_NOTHING:

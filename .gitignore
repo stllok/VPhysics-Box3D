@@ -62,4 +62,8 @@ obj*/
 build/
 CMakeUserPresets.json
 
+# Python cache
+__pycache__/
+*.pyc
+
 .omo
